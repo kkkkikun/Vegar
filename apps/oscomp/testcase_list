@@ -14,6 +14,7 @@ busybox cp /musl/lib/libc.so /lib/ld-linux-riscv64-lp64.so.1
 # ============ test cases compiled with musl ============
 # setup musl libraries
 # TODO: use symlink instead of cp
+busybox cp /musl/lib/libc.so /lib/ld-musl-riscv64-sf.so.1
 busybox cp /musl/lib/libc.so /lib/ld-musl-riscv64.so.1
 busybox cp /musl/lib/libc.so /lib/ld-musl-x86_64.so.1
 busybox cp /musl/lib/libc.so /lib/ld-musl-loongarch-lp64d.so.1
