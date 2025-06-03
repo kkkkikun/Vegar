@@ -60,7 +60,7 @@ test_build: ax_root
 	@cp -r $(PWD)/bin/* /root/.cargo/bin
 	@rustup override set nightly-2025-01-18
 	$(MAKE) defconfig EXTRA_CONFIG=$(EXTRA_CONFIG) ARCH=$(ARCH)
-	@make -C $(AX_ROOT) A=$(PWD) EXTRA_CONFIG=$(EXTRA_CONFIG) BLK=y NET=y LOG=error build
+	@make -C $(AX_ROOT) A=$(PWD) EXTRA_CONFIG=$(EXTRA_CONFIG) BLK=y NET=y build
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp $(OUT_BIN) kernel-rv; \
 	else \
