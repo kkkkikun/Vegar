@@ -22,7 +22,7 @@ fn main() {
         .filter(|&x| !x.is_empty());
 
     let command = testcases.collect::<Vec<_>>().join("\n");
-    let args = vec!["/bin/busybox", "sh", "-c", &command];
+    let args = vec!["/musl/busybox", "sh", "-c", &command];
     let args: Vec<String> = args.into_iter().map(String::from).collect();
 
     let envs = vec![
