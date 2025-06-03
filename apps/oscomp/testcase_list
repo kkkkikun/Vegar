@@ -1,0 +1,43 @@
+# ============ init code for oscomp test ============
+# setup the environment
+/musl/busybox mkdir -p /bin
+/musl/busybox cp /musl/busybox /bin/busybox
+# TODO: link busybox to /bin
+busybox cp /musl/busybox /bin/ls
+busybox mkdir -p /lib
+busybox mkdir -p /lib64
+busybox cp -v /glibc/lib/ld-linux-* /lib/
+# basic testcase on riscv64 requires "ld-linux-riscv64-lp64.so.1",
+# but we only have "ld-linux-riscv64-lp64d.so.1" in /glibc/lib
+busybox cp /musl/lib/libc.so /lib/ld-linux-riscv64-lp64.so.1
+
+# ============ test cases compiled with musl ============
+# setup musl libraries
+# TODO: use symlink instead of cp
+busybox cp /musl/lib/libc.so /lib/ld-musl-riscv64.so.1
+busybox cp /musl/lib/libc.so /lib/ld-musl-x86_64.so.1
+busybox cp /musl/lib/libc.so /lib/ld-musl-loongarch-lp64d.so.1
+busybox cp /musl/lib/libc.so /lib/ld-musl-aarch64.so.1
+busybox cp -v /musl/*.so /lib/
+busybox cp -r /lib/. /lib64/
+busybox ls -l /lib64/
+# begin test
+/musl/basic_testcode.sh
+/musl/libctest_testcode.sh
+/musl/busybox_testcode.sh
+/musl/lua_testcode.sh
+/musl/iozone_testcode.sh
+
+# ============ test cases compiled with glibc ============
+# setup glibc libraries
+busybox cp -v /glibc/lib/. /lib/
+# under loongarch64, lwext4 will crash
+# busybox cp -r /lib/. /lib64/
+busybox ls -l /lib64/
+
+# begin test
+/glibc/basic_testcode.sh
+/glibc/libctest_testcode.sh
+/glibc/busybox_testcode.sh
+/glibc/lua_testcode.sh
+/glibc/iozone_testcode.sh
