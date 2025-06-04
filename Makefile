@@ -42,13 +42,13 @@ include scripts/make/oscomp.mk
 # all: oscomp_build # 注释掉原来的 all 部分 
 all:
 	# Build for os competition
-	RUSTUP_TOOLCHAIN=nightly-2025-01-18 $(MAKE) test_build ARCH=riscv64 AX_TESTCASE=oscomp BUS=mmio FEATURES=fp_simd,lwext4_rs 
+	RUSTUP_TOOLCHAIN=nightly-2025-01-18 $(MAKE) test_build ARCH=riscv64 AX_TESTCASE=oscomp BUS=mmio  
 	# If loongarch64-linux-musl-cc is not found, please create a symbolic link to loongarch64-linux-musl-gcc
 	@if [ ! -f /opt/loongarch64-linux-musl-cross/bin/loongarch64-linux-musl-cc ]; then \
 		echo "loongarch64-linux-musl-cc not found, creating symbolic link to loongarch64-linux-musl-gcc"; \
 		cd /opt/musl-loongarch64-1.2.2/bin/ && ln -s loongarch64-linux-musl-gcc loongarch64-linux-musl-cc; \
 	fi
-	RUSTUP_TOOLCHAIN=nightly-2025-01-18 $(MAKE) test_build ARCH=loongarch64 AX_TESTCASE=oscomp FEATURES=fp_simd,lwext4_rs
+	RUSTUP_TOOLCHAIN=nightly-2025-01-18 $(MAKE) test_build ARCH=loongarch64 AX_TESTCASE=oscomp
 
 TARGET_LIST := x86_64-unknown-none riscv64gc-unknown-none-elf aarch64-unknown-none loongarch64-unknown-none
 ifeq ($(filter $(TARGET),$(TARGET_LIST)),)
@@ -60,7 +60,7 @@ test_build: ax_root
 	@cp -r $(PWD)/bin/* /root/.cargo/bin
 	@rustup override set nightly-2025-01-18
 	$(MAKE) defconfig EXTRA_CONFIG=$(EXTRA_CONFIG) ARCH=$(ARCH)
-	@make -C $(AX_ROOT) A=$(PWD) EXTRA_CONFIG=$(EXTRA_CONFIG) BLK=y NET=y build
+	make -C $(AX_ROOT) A=$(PWD) EXTRA_CONFIG=$(EXTRA_CONFIG) FEATURES=fp_simd,lwext4_rs BLK=y NET=y LOG=off build
 	@if [ "$(ARCH)" = "riscv64" ]; then \
 		cp $(OUT_BIN) kernel-rv; \
 	else \
@@ -74,10 +74,10 @@ clippy: defconfig
 
 ax_root:
 	@./scripts/set_ax_root.sh $(AX_ROOT)
-	@make -C $(AX_ROOT) disk_img
+	make -C $(AX_ROOT) disk_img
 
 user_apps:
-	@make -C ./apps/$(AX_TESTCASE) ARCH=$(ARCH) build
+	make -C ./apps/$(AX_TESTCASE) ARCH=$(ARCH) build
 	@if [ -z "$(shell command -v sudo)" ]; then \
 		./build_img.sh -a $(ARCH) -file ./apps/$(AX_TESTCASE)/build/$(ARCH) -s 160; \
 	else \
@@ -89,10 +89,10 @@ test: defconfig
 	@./scripts/app_test.sh
 
 defconfig build run justrun debug disasm: ax_root
-	@make -C $(AX_ROOT) A=$(PWD) EXTRA_CONFIG=$(EXTRA_CONFIG) $@
+	make -C $(AX_ROOT) A=$(PWD) EXTRA_CONFIG=$(EXTRA_CONFIG) $@
 
 clean: ax_root
-	@make -C $(AX_ROOT) A=$(PWD) ARCH=$(ARCH) clean
+	make -C $(AX_ROOT) A=$(PWD) ARCH=$(ARCH) clean
 	@for dir in $(shell ls ./apps); do \
 		make -C ./apps/$$dir clean; \
 	done
