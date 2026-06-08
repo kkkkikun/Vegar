@@ -68,8 +68,8 @@ all:
 	@cp workspace_riscv64-qemu-virt.bin kernel-rv
 	@cp workspace_loongarch64-qemu-virt.bin kernel-la
 	@echo "✓ Build complete:"
-	@echo "  kernel-rv ($(shell stat -c%s kernel-rv 2>/dev/null || stat -f%z kernel-rv) bytes)"
-	@echo "  kernel-la ($(shell stat -c%s kernel-la 2>/dev/null || stat -f%z kernel-la) bytes)"
+	@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
+	@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
 
 ROOTFS_URL = https://github.com/Starry-OS/rootfs/releases/download/20260214
 ROOTFS_IMG = rootfs-$(ARCH).img
@@ -131,8 +131,8 @@ ltp-all:
 	@cp workspace_riscv64-qemu-virt.bin kernel-rv
 	@cp workspace_loongarch64-qemu-virt.bin kernel-la
 	@echo "✓ LTP kernels ready:"
-	@echo "  kernel-rv ($(shell stat -c%s kernel-rv 2>/dev/null || stat -f%z kernel-rv) bytes)"
-	@echo "  kernel-la ($(shell stat -c%s kernel-la 2>/dev/null || stat -f%z kernel-la) bytes)"
+	@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
+	@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
 
 # === Custom test mode: run selected test groups defined in init_custom.sh ===
 # Edit TEST_GROUPS at the top of src/init_custom.sh to choose which tests to run
@@ -160,7 +160,7 @@ custom-all:
 	@cp workspace_riscv64-qemu-virt.bin kernel-rv
 	@cp workspace_loongarch64-qemu-virt.bin kernel-la
 	@echo "✓ Custom kernels ready:"
-	@echo "  kernel-rv ($(shell stat -c%s kernel-rv 2>/dev/null || stat -f%z kernel-rv) bytes)"
-	@echo "  kernel-la ($(shell stat -c%s kernel-la 2>/dev/null || stat -f%z kernel-la) bytes)"
+	@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
+	@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
 
 .PHONY: all build run justrun debug disasm clean ltp ltp-rv ltp-la ltp-all custom custom-rv custom-la custom-all

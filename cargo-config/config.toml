@@ -4,5 +4,6 @@ replace-with = 'vendored-sources'
 [source.vendored-sources]
 directory = 'vendor'
 
-[net]
-offline = true
+# Note: Don't set offline=true globally as it prevents installing
+# build tools that may not be in vendor directory. The vendored-sources
+# will be used when available, falling back to registry if needed.
