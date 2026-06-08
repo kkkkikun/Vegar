@@ -23,3 +23,6 @@ logs/
 # WSL Zone.Identifier metadata
 *:Zone.Identifier
 
+oscomp_test_logs/
+docs/ref/
+docs/command/
