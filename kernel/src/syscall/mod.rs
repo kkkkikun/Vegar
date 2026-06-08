@@ -629,6 +629,8 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
         Sysno::timer_create | Sysno::timer_gettime | Sysno::timer_settime => Ok(0),
 
+        Sysno::reboot => sys_reboot(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, uctx.arg3() as _),
+
         _ => {
             warn!("Unimplemented syscall: {sysno}");
             Err(AxError::Unsupported)

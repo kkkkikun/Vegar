@@ -67,6 +67,14 @@ smp = ["axfeat/smp", "axplat-riscv64-visionfive2?/smp"]
 
 vf2 = ["dep:axplat-riscv64-visionfive2", "axfeat/driver-sdmmc"]
 
+# LTP test mode: only run LTP tests instead of full test suite
+# Used for debugging LTP failures without waiting for full test chain
+ltp-only = []
+
+# Custom test mode: run selected test groups defined in init_custom.sh
+# Edit TEST_GROUPS at the top of init_custom.sh to choose which tests to run
+custom = []
+
 [[bin]]
 name = "starryos"
 path = "src/main.rs"

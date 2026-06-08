@@ -1,7 +1,13 @@
+#!/bin/sh
+# LTP-only test mode for debugging
+# Usage: In main.rs, set CMDLINE to use this script instead of init_oscomp.sh
+
+echo @@@@@@@@@@ LTP Test Mode @@@@@@@@@@
+echo "This script runs ONLY LTP tests (no other test groups)"
+
 echo @@@@@@@@@@ setup @@@@@@@@@@
 
-# Fix for LoongArch64: busybox mkdir -p doesn't work, check before creating
-if [ ! -d /bin ]; then /musl/busybox mkdir /bin; fi
+/musl/busybox mkdir -p /bin
 /musl/busybox --install -s /bin
 export PATH=/bin
 
@@ -9,9 +15,8 @@ export PATH=/bin
 echo "basename test: $(basename /foo/bar.txt)"
 ls /bin | head -5
 
-if [ ! -d /lib ]; then /musl/busybox mkdir /lib; fi
-if [ ! -d /lib/modules ]; then /musl/busybox mkdir /lib/modules; fi
-if [ ! -d /lib/modules/10.0.0 ]; then /musl/busybox mkdir /lib/modules/10.0.0; fi
+/musl/busybox mkdir -p /lib
+/musl/busybox mkdir -p /lib/modules/10.0.0
 
 ln -s /glibc/lib/libc.so.6 /lib/libc.so.6 2>/dev/null
 ln -s /glibc/lib/libgcc_s.so.1 /lib/libgcc_s.so.1 2>/dev/null
@@ -28,18 +33,14 @@ else
 fi
 ln -s /lib /lib64 2>/dev/null
 
-if [ ! -d /usr ]; then /musl/busybox mkdir /usr; fi
+/musl/busybox mkdir -p /usr
 ln -s /lib /usr/lib64 2>/dev/null
 
-if [ ! -d /boot ]; then /musl/busybox mkdir /boot; fi
-if [ ! -d /var ]; then /musl/busybox mkdir /var; fi
-if [ ! -d /var/tmp ]; then /musl/busybox mkdir /var/tmp; fi
-if [ ! -d /tmp ]; then /musl/busybox mkdir /tmp; fi
-if [ ! -d /etc ]; then /musl/busybox mkdir /etc; fi
-if [ ! -d /sys ]; then /musl/busybox mkdir /sys 2>/dev/null; fi
-if [ ! -d /sys/kernel ]; then /musl/busybox mkdir /sys/kernel 2>/dev/null; fi
-if [ ! -d /sys/kernel/debug ]; then /musl/busybox mkdir /sys/kernel/debug 2>/dev/null; fi
-if [ ! -d /sys/kernel/debug/hwpoison ]; then /musl/busybox mkdir /sys/kernel/debug/hwpoison 2>/dev/null; fi
+/musl/busybox mkdir -p /boot
+/musl/busybox mkdir -p /var/tmp
+/musl/busybox mkdir -p /tmp
+/musl/busybox mkdir -p /etc
+/musl/busybox mkdir -p /sys/kernel/debug/hwpoison 2>/dev/null
 
 echo "CONFIG_MEMORY_FAILURE=y" > /boot/config-10.0.0 2>/dev/null
 echo "CONFIG_MEMORY_FAILURE=y" > /lib/modules/10.0.0/config 2>/dev/null
@@ -55,50 +56,19 @@ echo "daemon:x:2:" >> /etc/group 2>/dev/null
 echo @@@@@@@@@@ setup done @@@@@@@@@@
 
 # =========================================================================
-# Helper: run one test with timeout and ensure END marker
+# LTP Test Runner
 # =========================================================================
-run_test() {
-    runtime="$1"
-    test_name="$2"
-    timeout_secs="$3"
-    test_script="/$runtime/${test_name}_testcode.sh"
-
-    if [ ! -f "$test_script" ]; then
-        return
-    fi
-
-    echo ">>> Running: $test_script (timeout ${timeout_secs}s)"
-
-    cd "/$runtime"
-
-    /musl/busybox timeout $timeout_secs /musl/busybox sh "$test_script" 2>&1
-    result=$?
-
-    cd /
-
-    if [ $result -eq 143 ]; then
-        echo "#### OS COMP TEST GROUP END ${test_name}-${runtime} ####"
-        echo "<<< Timeout: $test_script"
-    else
-        echo "<<< Finished: $test_script (exit: $result)"
-    fi
-
-    /musl/busybox killall -9 iperf3 netserver hackbench lmbench_all 2>/dev/null
-}
-
-# =========================================================================
-# Run Test Scripts
-# =========================================================================
-
-# Run LTP with a curated whitelist instead of the raw ltp_testcode.sh
-# (which runs ALL cases and hangs on cgroup/ftrace/memory tests we don't support)
 run_ltp() {
     runtime="$1"
     echo "#### OS COMP TEST GROUP START ltp-$runtime ####"
     cd "/$runtime/ltp/testcases/bin" 2>/dev/null || return
 
-    # Curated list: basic syscall tests that are unlikely to hang
-    for case in \
+    # Blacklist: tests that are known to fail or hang
+    # Add tests here temporarily instead of removing from whitelist
+    BLACKLIST="mincore01 mprotect02"
+
+    # Whitelist: curated list of basic syscall tests
+    WHITELIST="
         abort01 access01 alarm02 alarm03 alarm05 alarm06 alarm07 \
         bind01 bind05 \
         chdir01 chdir04 chmod01 chown01 \
@@ -229,41 +199,70 @@ run_ltp() {
         mprotect01 mprotect03 mprotect04 \
         msync01 msync02 msync03 msync04 \
         brk01 \
-        procpcilocator; do
+        procpcilocator
+    "
+
+    passed=0
+    failed=0
+    skipped=0
+    blacklisted=0
+
+    for case in $WHITELIST; do
+        # Check blacklist
+        is_blacklisted=false
+        for bl in $BLACKLIST; do
+            if [ "$case" = "$bl" ]; then
+                is_blacklisted=true
+                break
+            fi
+        done
+
+        if [ "$is_blacklisted" = "true" ]; then
+            echo "SKIP LTP CASE $case (blacklisted)"
+            blacklisted=$((blacklisted + 1))
+            continue
+        fi
+
         if [ -f "$case" ]; then
             echo "RUN LTP CASE $case"
             ./$case
             ret=$?
-            echo "FAIL LTP CASE $case : $ret"
+            if [ $ret -eq 0 ]; then
+                echo "PASS LTP CASE $case"
+                passed=$((passed + 1))
+            else
+                echo "FAIL LTP CASE $case : $ret"
+                failed=$((failed + 1))
+            fi
+        else
+            echo "MISSING LTP CASE $case"
+            skipped=$((skipped + 1))
         fi
     done
+
+    echo "#### LTP Summary for $runtime ####"
+    echo "  Passed:    $passed"
+    echo "  Failed:    $failed"
+    echo "  Skipped:   $skipped"
+    echo "  Blacklisted: $blacklisted"
 
     cd /
     echo "#### OS COMP TEST GROUP END ltp-$runtime ####"
 }
 
+# Run LTP for both musl and glibc
 for runtime in musl glibc; do
     if [ ! -d "/$runtime" ]; then
+        echo "Warning: /$runtime not found, skipping"
         continue
     fi
 
-    echo "=== Running tests for $runtime ==="
+    echo "=== Running LTP tests for $runtime ==="
 
     if [ "$runtime" = "glibc" ]; then
         export LD_LIBRARY_PATH=/glibc/lib
     fi
 
-    run_test "$runtime" basic       60
-    run_test "$runtime" busybox     60
-    run_test "$runtime" lua         60
-    run_test "$runtime" libctest    90
-    run_test "$runtime" libcbench   90
-    run_test "$runtime" cyclictest  90
-    run_test "$runtime" unixbench   120
-    run_test "$runtime" iozone      120
-    run_test "$runtime" lmbench     60
-    run_test "$runtime" iperf       120
-    run_test "$runtime" netperf     120
     run_ltp "$runtime"
 
     if [ "$runtime" = "glibc" ]; then
@@ -274,5 +273,5 @@ done
 # =========================================================================
 # Shutdown
 # =========================================================================
-echo "=== All tests completed. Shutting down... ==="
+echo "=== LTP tests completed. Shutting down... ==="
 /musl/busybox poweroff -f

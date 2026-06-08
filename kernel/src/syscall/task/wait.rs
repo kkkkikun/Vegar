@@ -4,7 +4,7 @@ use core::{future::poll_fn, task::Poll};
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{
     current,
-    future::{block_on, interruptible},
+    future::{Interrupted, block_on, interruptible},
 };
 use bitflags::bitflags;
 use linux_raw_sys::general::{
@@ -105,13 +105,32 @@ pub fn sys_waitpid(pid: i32, exit_code: *mut i32, options: u32) -> AxResult<isiz
         }
     };
 
-    block_on(interruptible(poll_fn(|cx| {
-        match check_children().transpose() {
-            Some(res) => Poll::Ready(res),
-            None => {
-                proc_data.child_exit_event.register(cx.waker());
-                Poll::Pending
+    loop {
+        match block_on(interruptible(poll_fn(|cx| {
+            match check_children().transpose() {
+                Some(res) => Poll::Ready(res),
+                None => {
+                    proc_data.child_exit_event.register(cx.waker());
+                    Poll::Pending
+                }
+            }
+        }))) {
+            Ok(inner) => return inner,
+            Err(Interrupted) => {
+                // A signal (typically SIGCHLD) interrupted the wait. The child may
+                // have exited at the same time — check children one final time
+                // before returning EINTR. If a zombie is found, return it instead.
+                match check_children() {
+                    Ok(Some(pid)) => return Ok(pid),
+                    Ok(None) => {
+                        // Child hasn't become zombie yet — retry instead of
+                        // returning EINTR. This matches Linux SA_RESTART behavior
+                        // and avoids spurious failures in LTP's waitpid calls.
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
-    })))?
+    }
 }

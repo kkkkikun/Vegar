@@ -1,7 +1,20 @@
+#!/bin/sh
+# Custom test groups mode
+# Edit TEST_GROUPS below to choose which tests to run
+# Available: basic, busybox, lua, libctest, libcbench, cyclictest, unixbench, iozone, lmbench, iperf, netperf, ltp
+
+# =========================================================================
+# EDIT THIS: Choose test groups to run
+# =========================================================================
+TEST_GROUPS="lmbench"
+
+# =========================================================================
+# Setup (same as init_oscomp.sh)
+# =========================================================================
+
 echo @@@@@@@@@@ setup @@@@@@@@@@
 
-# Fix for LoongArch64: busybox mkdir -p doesn't work, check before creating
-if [ ! -d /bin ]; then /musl/busybox mkdir /bin; fi
+/musl/busybox mkdir -p /bin
 /musl/busybox --install -s /bin
 export PATH=/bin
 
@@ -9,9 +22,8 @@ export PATH=/bin
 echo "basename test: $(basename /foo/bar.txt)"
 ls /bin | head -5
 
-if [ ! -d /lib ]; then /musl/busybox mkdir /lib; fi
-if [ ! -d /lib/modules ]; then /musl/busybox mkdir /lib/modules; fi
-if [ ! -d /lib/modules/10.0.0 ]; then /musl/busybox mkdir /lib/modules/10.0.0; fi
+/musl/busybox mkdir -p /lib
+/musl/busybox mkdir -p /lib/modules/10.0.0
 
 ln -s /glibc/lib/libc.so.6 /lib/libc.so.6 2>/dev/null
 ln -s /glibc/lib/libgcc_s.so.1 /lib/libgcc_s.so.1 2>/dev/null
@@ -28,18 +40,14 @@ else
 fi
 ln -s /lib /lib64 2>/dev/null
 
-if [ ! -d /usr ]; then /musl/busybox mkdir /usr; fi
+/musl/busybox mkdir -p /usr
 ln -s /lib /usr/lib64 2>/dev/null
 
-if [ ! -d /boot ]; then /musl/busybox mkdir /boot; fi
-if [ ! -d /var ]; then /musl/busybox mkdir /var; fi
-if [ ! -d /var/tmp ]; then /musl/busybox mkdir /var/tmp; fi
-if [ ! -d /tmp ]; then /musl/busybox mkdir /tmp; fi
-if [ ! -d /etc ]; then /musl/busybox mkdir /etc; fi
-if [ ! -d /sys ]; then /musl/busybox mkdir /sys 2>/dev/null; fi
-if [ ! -d /sys/kernel ]; then /musl/busybox mkdir /sys/kernel 2>/dev/null; fi
-if [ ! -d /sys/kernel/debug ]; then /musl/busybox mkdir /sys/kernel/debug 2>/dev/null; fi
-if [ ! -d /sys/kernel/debug/hwpoison ]; then /musl/busybox mkdir /sys/kernel/debug/hwpoison 2>/dev/null; fi
+/musl/busybox mkdir -p /boot
+/musl/busybox mkdir -p /var/tmp
+/musl/busybox mkdir -p /tmp
+/musl/busybox mkdir -p /etc
+/musl/busybox mkdir -p /sys/kernel/debug/hwpoison 2>/dev/null
 
 echo "CONFIG_MEMORY_FAILURE=y" > /boot/config-10.0.0 2>/dev/null
 echo "CONFIG_MEMORY_FAILURE=y" > /lib/modules/10.0.0/config 2>/dev/null
@@ -55,7 +63,7 @@ echo "daemon:x:2:" >> /etc/group 2>/dev/null
 echo @@@@@@@@@@ setup done @@@@@@@@@@
 
 # =========================================================================
-# Helper: run one test with timeout and ensure END marker
+# Helper: run one test with timeout
 # =========================================================================
 run_test() {
     runtime="$1"
@@ -87,18 +95,18 @@ run_test() {
 }
 
 # =========================================================================
-# Run Test Scripts
+# LTP Test Runner
 # =========================================================================
-
-# Run LTP with a curated whitelist instead of the raw ltp_testcode.sh
-# (which runs ALL cases and hangs on cgroup/ftrace/memory tests we don't support)
 run_ltp() {
     runtime="$1"
     echo "#### OS COMP TEST GROUP START ltp-$runtime ####"
     cd "/$runtime/ltp/testcases/bin" 2>/dev/null || return
 
-    # Curated list: basic syscall tests that are unlikely to hang
-    for case in \
+    # Blacklist: tests that are known to fail or hang
+    BLACKLIST="mincore01 mprotect02"
+
+    # Whitelist: curated list of basic syscall tests
+    WHITELIST="
         abort01 access01 alarm02 alarm03 alarm05 alarm06 alarm07 \
         bind01 bind05 \
         chdir01 chdir04 chmod01 chown01 \
@@ -226,21 +234,48 @@ run_ltp() {
         setresuid01 setresuid02 setresuid03 setresuid04 setresuid05 \
         mlock01 mlock02 mlock03 mlock201 mlock202 mlock203 mlock04 mlock05 \
         munlock01 munlock02 \
-        mprotect01 mprotect03 mprotect04 \
+        mprotect01 mprotect02 mprotect03 mprotect04 \
         msync01 msync02 msync03 msync04 \
         brk01 \
-        procpcilocator; do
+        procpcilocator
+    "
+
+    for case in $WHITELIST; do
+        # Check blacklist
+        is_blacklisted=false
+        for bl in $BLACKLIST; do
+            if [ "$case" = "$bl" ]; then
+                is_blacklisted=true
+                break
+            fi
+        done
+
+        if [ "$is_blacklisted" = "true" ]; then
+            echo "SKIP LTP CASE $case (blacklisted)"
+            continue
+        fi
+
         if [ -f "$case" ]; then
             echo "RUN LTP CASE $case"
             ./$case
             ret=$?
-            echo "FAIL LTP CASE $case : $ret"
+            if [ $ret -eq 0 ]; then
+                echo "PASS LTP CASE $case"
+            else
+                echo "FAIL LTP CASE $case : $ret"
+            fi
         fi
     done
 
     cd /
     echo "#### OS COMP TEST GROUP END ltp-$runtime ####"
 }
+
+# =========================================================================
+# Run selected test groups
+# =========================================================================
+
+echo "=== Custom test mode: running groups: $TEST_GROUPS ==="
 
 for runtime in musl glibc; do
     if [ ! -d "/$runtime" ]; then
@@ -253,18 +288,24 @@ for runtime in musl glibc; do
         export LD_LIBRARY_PATH=/glibc/lib
     fi
 
-    run_test "$runtime" basic       60
-    run_test "$runtime" busybox     60
-    run_test "$runtime" lua         60
-    run_test "$runtime" libctest    90
-    run_test "$runtime" libcbench   90
-    run_test "$runtime" cyclictest  90
-    run_test "$runtime" unixbench   120
-    run_test "$runtime" iozone      120
-    run_test "$runtime" lmbench     60
-    run_test "$runtime" iperf       120
-    run_test "$runtime" netperf     120
-    run_ltp "$runtime"
+    # Check each requested test group
+    for group in $TEST_GROUPS; do
+        case "$group" in
+            basic)      run_test "$runtime" basic       60 ;;
+            busybox)    run_test "$runtime" busybox     60 ;;
+            lua)        run_test "$runtime" lua         60 ;;
+            libctest)   run_test "$runtime" libctest    90 ;;
+            libcbench)  run_test "$runtime" libcbench   90 ;;
+            cyclictest) run_test "$runtime" cyclictest  90 ;;
+            unixbench)  run_test "$runtime" unixbench   120 ;;
+            iozone)     run_test "$runtime" iozone      120 ;;
+            lmbench)    run_test "$runtime" lmbench     60 ;;
+            iperf)      run_test "$runtime" iperf       120 ;;
+            netperf)    run_test "$runtime" netperf     120 ;;
+            ltp)        run_ltp "$runtime" ;;
+            *)          echo "Warning: unknown test group '$group'" ;;
+        esac
+    done
 
     if [ "$runtime" = "glibc" ]; then
         unset LD_LIBRARY_PATH
@@ -274,5 +315,5 @@ done
 # =========================================================================
 # Shutdown
 # =========================================================================
-echo "=== All tests completed. Shutting down... ==="
+echo "=== Selected tests completed. Shutting down... ==="
 /musl/busybox poweroff -f

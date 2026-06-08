@@ -5,7 +5,6 @@ mod device;
 mod dir;
 mod file;
 mod fs;
-mod lib;
 mod proc;
 mod tmp;
 
@@ -79,9 +78,6 @@ pub fn mount_all() -> LinuxResult<()> {
     path.push("subsystem");
     fs.symlink("whatever", &path)?;
     drop(fs);
-
-    // Mount /lib with musl dynamic linker for OSComp
-    lib::mount_libfs()?;
 
     #[cfg(feature = "dev-log")]
     dev::bind_dev_log().expect("Failed to bind /dev/log");

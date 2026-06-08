@@ -125,6 +125,34 @@ pub fn sys_seccomp(_op: u32, _flags: u32, _args: *const ()) -> AxResult<isize> {
     Ok(0)
 }
 
+/// reboot syscall - handles poweroff (-f) and reboot commands.
+/// magic: LINUX_REBOOT_MAGIC1 (0xfee1dead)
+/// cmd: LINUX_REBOOT_CMD_POWER_OFF (0x4321fedc) or LINUX_REBOOT_CMD_RESTART (0x01234567)
+pub fn sys_reboot(magic: u32, _magic2: u32, cmd: u32, _arg: usize) -> AxResult<isize> {
+    const LINUX_REBOOT_MAGIC1: u32 = 0xfee1dead;
+    const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321fedc;
+    const LINUX_REBOOT_CMD_RESTART: u32 = 0x01234567;
+
+    if magic != LINUX_REBOOT_MAGIC1 {
+        return Err(AxError::InvalidInput);
+    }
+
+    match cmd {
+        LINUX_REBOOT_CMD_POWER_OFF => {
+            info!("sys_reboot: power off");
+            axhal::power::system_off();
+        }
+        LINUX_REBOOT_CMD_RESTART => {
+            info!("sys_reboot: restart");
+            axhal::power::system_off();
+        }
+        _ => {
+            warn!("sys_reboot: unknown cmd {cmd:#x}");
+            return Err(AxError::InvalidInput);
+        }
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 pub fn sys_riscv_flush_icache() -> AxResult<isize> {
     riscv::asm::fence_i();

@@ -14,7 +14,7 @@ use axhal::{
     trap::{PAGE_FAULT, register_trap_handler},
 };
 use axio::prelude::*;
-use axtask::current;
+use axtask::{current, current_may_uninit};
 use extern_trait::extern_trait;
 use kernel_guard::IrqSave;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
@@ -259,7 +259,9 @@ pub(crate) use nullable;
 fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags) -> bool {
     debug!("Page fault at {vaddr:#x}, access_flags: {access_flags:#x?}");
 
-    let curr = current();
+    let Some(curr) = current_may_uninit() else {
+        return false;
+    };
     let Some(thr) = curr.try_as_thread() else {
         return false;
     };
