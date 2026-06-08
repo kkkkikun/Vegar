@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          # x86 targets
+          - x86_64-unknown-none
+          - i686-unknown-linux-gnu
+          # ARM targets
+          - aarch64-unknown-none
+          - armv7-unknown-linux-gnueabihf
+          - arm-unknown-linux-gnueabihf
+          # RISC-V targets
+          - riscv64gc-unknown-none-elf
+          - riscv32imac-unknown-none-elf
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: ${{ matrix.target }}
+        override: true
+        components: rustfmt, clippy
+
+    - name: Build
+      run: cargo build --target ${{ matrix.target }} --verbose
+
+    - name: Build with SMP feature
+      run: cargo build --target ${{ matrix.target }} --features smp --verbose
+
+    - name: Build examples
+      run: cargo build --examples --verbose
+
+    - name: Run tests
+      run: cargo test --verbose
+
+  test-qemu:
+    name: Test with QEMU
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # RISC-V 64-bit (use Linux target for testing)
+          - target: riscv64gc-unknown-linux-gnu
+            arch: riscv64
+            qemu_arch: riscv64
+            qemu_cpu: rv64
+          # ARM 64-bit (use Linux target for testing)
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            qemu_arch: aarch64
+            qemu_cpu: cortex-a72
+          # ARM 32-bit (use Linux target for testing)
+          - target: armv7-unknown-linux-gnueabihf
+            arch: armv7
+            qemu_arch: arm
+            qemu_cpu: cortex-a15
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: ${{ matrix.target }}
+        override: true
+        components: rustfmt, clippy
+
+    - name: Install QEMU and cross-compilation tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y qemu-user qemu-user-static
+        case "${{ matrix.arch }}" in
+          "riscv64")
+            sudo apt-get install -y gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+            ;;
+          "aarch64")
+            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            ;;
+          "armv7")
+            sudo apt-get install -y gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+            ;;
+        esac
+
+    - name: Configure cross-compilation
+      run: |
+        mkdir -p ~/.cargo
+        cat >> ~/.cargo/config.toml << EOF
+        [target.riscv64gc-unknown-linux-gnu]
+        linker = "riscv64-linux-gnu-gcc"
+        rustflags = ["-C", "target-feature=+crt-static"]
+
+        [target.aarch64-unknown-linux-gnu]
+        linker = "aarch64-linux-gnu-gcc"
+        rustflags = ["-C", "target-feature=+crt-static"]
+
+        [target.armv7-unknown-linux-gnueabihf]
+        linker = "arm-linux-gnueabihf-gcc"
+        rustflags = ["-C", "target-feature=+crt-static"]
+        EOF
+
+    - name: Build for target
+      run: cargo build --target ${{ matrix.target }} --verbose
+
+    - name: Build with SMP feature
+      run: cargo build --target ${{ matrix.target }} --features smp --verbose
+
+    - name: Run tests with QEMU
+      run: |
+        # Build test binary
+        cargo test --target ${{ matrix.target }} --no-run --verbose
+        
+        # Find the test binary
+        TEST_BINARY=$(find target/${{ matrix.target }}/debug/deps -name 'mbarrier-*' -type f -executable | head -1)
+        
+        if [ -z "$TEST_BINARY" ]; then
+          echo "Test binary not found"
+          exit 1
+        fi
+        
+        echo "Running test binary: $TEST_BINARY"
+        
+        # Run tests with QEMU
+        case "${{ matrix.qemu_arch }}" in
+          "riscv64")
+            qemu-riscv64-static -cpu ${{ matrix.qemu_cpu }} "$TEST_BINARY"
+            ;;
+          "aarch64")
+            qemu-aarch64-static -cpu ${{ matrix.qemu_cpu }} "$TEST_BINARY"
+            ;;
+          "arm")
+            qemu-arm-static -cpu ${{ matrix.qemu_cpu }} "$TEST_BINARY"
+            ;;
+        esac
+
+    - name: Run tests with SMP features using QEMU
+      run: |
+        # Clean previous builds
+        cargo clean --target ${{ matrix.target }}
+        
+        # Build test binary with SMP features
+        cargo test --target ${{ matrix.target }} --features smp --no-run --verbose
+        
+        # Find the test binary
+        TEST_BINARY=$(find target/${{ matrix.target }}/debug/deps -name 'mbarrier-*' -type f -executable | head -1)
+        
+        if [ -z "$TEST_BINARY" ]; then
+          echo "SMP test binary not found"
+          exit 1
+        fi
+        
+        echo "Running SMP test binary: $TEST_BINARY"
+        
+        # Run SMP tests with QEMU
+        case "${{ matrix.qemu_arch }}" in
+          "riscv64")
+            qemu-riscv64-static -cpu ${{ matrix.qemu_cpu }} "$TEST_BINARY"
+            ;;
+          "aarch64")
+            qemu-aarch64-static -cpu ${{ matrix.qemu_cpu }} "$TEST_BINARY"
+            ;;
+          "arm")
+            qemu-arm-static -cpu ${{ matrix.qemu_cpu }} "$TEST_BINARY"
+            ;;
+        esac
+
+
+

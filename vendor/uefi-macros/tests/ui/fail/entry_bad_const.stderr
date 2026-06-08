@@ -1,0 +1,5 @@
+error: Entry function should not be const
+ --> tests/ui/fail/entry_bad_const.rs:6:1
+  |
+6 | const fn main() -> Status {
+  | ^^^^^

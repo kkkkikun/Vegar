@@ -32,7 +32,27 @@ ifeq ($(TEST_MODE), custom)
 APP_FEATURES += custom
 endif
 
-default: build
+# =========================================================================
+# Fix for hidden directories in competition environment
+# The evaluation system filters out hidden files/directories during clone.
+# We rename them to non-hidden names before build.
+# =========================================================================
+.PHONY: prepare-hidden
+prepare-hidden:
+	@# Setup cargo config for offline build
+	@if [ -d cargo-config ] && [ ! -d .cargo ]; then \
+		cp -r cargo-config .cargo; \
+	fi
+	@# Clean old config when ARCH changes
+	@if [ -f make/.old_config_arch ]; then \
+		if [ "$(ARCH)" != "$$(cat make/.old_config_arch 2>/dev/null)" ]; then \
+			rm -f .axconfig.toml; \
+		fi \
+	fi
+
+default: prepare-hidden build
+
+build: prepare-hidden
 
 # === OSComp submission entry: build both arch kernels ===
 # Uses bin format since QEMU -kernel loads raw binaries at correct address.
@@ -66,7 +86,10 @@ img:
 	@echo -e "\033[33mWARN: The 'img' target is deprecated. Please use 'rootfs' instead.\033[0m"
 	@$(MAKE) --no-print-directory rootfs
 
-defconfig justrun clean:
+defconfig: prepare-hidden
+	@$(MAKE) -C make $@
+
+justrun clean:
 	@$(MAKE) -C make $@
 
 build run debug disasm: defconfig

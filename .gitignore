@@ -5,10 +5,13 @@
 *.dbg
 **/target/
 /.axconfig.*
+!axconfig.toml
 *.img
 /kernel-rv
 /kernel-la
-/.cargo
+/.cargo/
+!cargo-config/
+!vendor/
 /.crates*
 /mnt
 *.swp
