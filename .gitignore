@@ -1,0 +1,22 @@
+/.idea
+.DS_Store
+*.elf
+*.bin
+*.dbg
+**/target/
+/.axconfig.*
+*.img
+/kernel-rv
+/kernel-la
+/.cargo
+/.crates*
+/mnt
+*.swp
+*.swo
+
+# OSComp test logs (regenerated each run)
+logs/
+
+# WSL Zone.Identifier metadata
+*:Zone.Identifier
+
