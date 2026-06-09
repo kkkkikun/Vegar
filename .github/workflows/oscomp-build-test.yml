@@ -15,12 +15,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 使用比赛 Docker 环境进行完整测试
+  # 使用官方评测 Docker 环境进行完整测试
   docker-build-test:
-    name: Docker 环境构建测试
+    name: 官方评测环境测试
     runs-on: ubuntu-latest
     container:
-      image: docker.cnb.cool/starry-os/arceos-build:latest
+      image: zhouzhouyi/os-contest:20260510
       options: --user root
 
     steps:
@@ -82,12 +82,12 @@ jobs:
             disk.img
           retention-days: 7
 
-  # 干净克隆测试：模拟真实评测场景
+  # 干净克隆测试：使用官方评测环境
   fresh-clone-test:
-    name: 干净克隆环境测试
+    name: 干净克隆环境测试（官方镜像）
     runs-on: ubuntu-latest
     container:
-      image: docker.cnb.cool/starry-os/arceos-build:latest
+      image: zhouzhouyi/os-contest:20260510
       options: --user root
 
     steps:
