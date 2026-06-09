@@ -1,4 +1,4 @@
-name: OSComp Build Test
+name: OSComp 评测模拟
 
 on:
   push:
@@ -15,111 +15,145 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  oscomp-build:
-    name: Build OSComp Submission
+  # 评测环境模拟：克隆并构建
+  build-test:
+    name: 评测环境构建测试
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: 克隆代码（模拟评测系统）
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          target: riscv64gc-unknown-none-elf
-
-      - name: Install cross-compilation tools
+      - name: 安装 RISC-V 工具链
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            gcc-riscv64-linux-gnu \
-            gcc-loongarch64-linux-gnu \
-            make \
-            curl \
-            xz-utils
+          sudo apt-get install -y gcc-riscv64-linux-gnu
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install rust targets
+      - name: 安装 LoongArch64 工具链
         run: |
+          sudo apt-get install -y gcc-loongarch64-linux-gnu
+
+      - name: 安装 Rust 和交叉编译目标
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           rustup target add riscv64gc-unknown-none-elf
           rustup target add loongarch64-unknown-none-softfloat
 
-      - name: Build OSComp submission (make all)
+      - name: 安装 QEMU 9.2.1（模拟评测环境）
         run: |
-          echo "=== Building OSComp 2026 Submission ==="
+          sudo apt-get install -y qemu-system qemu-utils
+          qemu-system-riscv64 --version
+          qemu-system-loongarch64 --version
+
+      - name: 清理隐藏目录（模拟评测系统过滤）
+        run: |
+          echo "=== 模拟评测系统过滤隐藏文件 ==="
+          find . -name ".*" -type d -not -path "./.git/*" -not -path "./.github/*" -exec rm -rf {} + 2>/dev/null || true
+          find . -name ".*" -type f -not -path "./.git/*" -not -path "./.github/*" -delete 2>/dev/null || true
+
+      - name: 执行 make all（评测命令）
+        run: |
+          echo "=== 执行官方评测命令：make all ==="
           make all
 
-      - name: Verify kernel files exist
+      - name: 验证必需文件存在
         run: |
-          echo "=== Verifying build outputs ==="
-          if [ ! -f kernel-rv ]; then
-            echo "ERROR: kernel-rv not found"
-            exit 1
-          fi
-          if [ ! -f kernel-la ]; then
-            echo "ERROR: kernel-la not found"
-            exit 1
-          fi
-          echo "✓ kernel-rv: $(wc -c < kernel-rv) bytes"
-          echo "✓ kernel-la: $(wc -c < kernel-la) bytes"
+          echo "=== 验证评测必需文件 ==="
 
-      - name: Upload kernels
+          # 检查 kernel-rv（RISC-V 内核）
+          if [ ! -f kernel-rv ]; then
+            echo "❌ 错误：kernel-rv 文件不存在"
+            exit 1
+          fi
+          echo "✓ kernel-rv 存在 ($(wc -c < kernel-rv) 字节)"
+
+          # 检查 kernel-la（LoongArch64 内核）
+          if [ ! -f kernel-la ]; then
+            echo "❌ 错误：kernel-la 文件不存在"
+            exit 1
+          fi
+          echo "✓ kernel-la 存在 ($(wc -c < kernel-la) 字节)"
+
+          # 检查文件格式（应该是 ELF）
+          file kernel-rv | grep -q ELF || echo "⚠️  警告：kernel-rv 不是 ELF 格式"
+          file kernel-la | grep -q ELF || echo "⚠️  警告：kernel-la 不是 ELF 格式"
+
+      - name: 检查可选文件
+        run: |
+          echo "=== 检查可选辅助文件 ==="
+
+          if [ -f disk.img ]; then
+            echo "✓ disk.img 存在 ($(wc -c < disk.img) 字节)"
+          else
+            echo "ℹ️  disk.img 不存在（可选文件）"
+          fi
+
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: oscomp-kernels
           path: |
             kernel-rv
             kernel-la
+            disk.img
           retention-days: 7
 
-  oscomp-checksum-test:
-    name: Test Checksum Validation
+  # 干净克隆测试：模拟真实评测场景
+  fresh-clone-test:
+    name: 干净克隆环境测试
     runs-on: ubuntu-latest
-    needs: oscomp-build
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Test fresh clone build
+      - name: 模拟评测系统克隆项目
         run: |
-          echo "=== Testing fresh clone scenario ==="
+          echo "=== 模拟评测系统克隆项目 ==="
           cd /tmp
-          rm -rf test-clone
-          git clone --depth=1 ${{ github.repositoryUrl }} test-clone
-          cd test-clone
+          rm -rf starryos-test
+          git clone --depth=1 ${{ github.repositoryUrl }} starryos-test
+          cd starryos-test
 
-          echo "Building in clean environment..."
+      - name: 安装依赖
+        run: |
+          cd /tmp/starryos-test
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu gcc-loongarch64-linux-gnu qemu-system qemu-utils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add riscv64gc-unknown-none-elf
+          rustup target add loongarch64-unknown-none-softfloat
+
+      - name: 清理隐藏目录
+        run: |
+          cd /tmp/starryos-test
+          echo "=== 清理隐藏目录 ==="
+          find . -name ".*" -type d -not -path "./.git/*" -exec rm -rf {} + 2>/dev/null || true
+          find . -name ".*" -type f -not -path "./.git/*" -delete 2>/dev/null || true
+
+      - name: 执行 make all
+        run: |
+          cd /tmp/starryos-test
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "=== 在干净环境中执行 make all ==="
           make all
 
-          if [ ! -f kernel-rv ] || [ ! -f kernel-la ]; then
-            echo "ERROR: Build failed in clean environment"
+      - name: 验证构建结果
+        run: |
+          cd /tmp/starryos-test
+          echo "=== 验证构建结果 ==="
+
+          if [ ! -f kernel-rv ]; then
+            echo "❌ 干净克隆环境：kernel-rv 构建失败"
             exit 1
           fi
 
-          echo "✓ Fresh clone build successful"
+          if [ ! -f kernel-la ]; then
+            echo "❌ 干净克隆环境：kernel-la 构建失败"
+            exit 1
+          fi
+
+          echo "✓ 干净克隆环境构建成功"
+          echo "  kernel-rv: $(wc -c < kernel-rv) 字节"
+          echo "  kernel-la: $(wc -c < kernel-la) 字节"
