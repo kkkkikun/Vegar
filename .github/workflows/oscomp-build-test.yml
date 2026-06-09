@@ -15,38 +15,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 评测环境模拟：克隆并构建
-  build-test:
-    name: 评测环境构建测试
+  # 使用比赛 Docker 环境进行完整测试
+  docker-build-test:
+    name: Docker 环境构建测试
     runs-on: ubuntu-latest
+    container:
+      image: docker.cnb.cool/starry-os/arceos-build:latest
+      options: --user root
 
     steps:
-      - name: 克隆代码（模拟评测系统）
+      - name: 克隆代码
         uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: 安装 RISC-V 工具链
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu
-
-      - name: 安装 LoongArch64 工具链
-        run: |
-          sudo apt-get install -y gcc-loongarch64-linux-gnu
-
-      - name: 安装 Rust 和交叉编译目标
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          rustup target add riscv64gc-unknown-none-elf
-          rustup target add loongarch64-unknown-none-softfloat
-
-      - name: 安装 QEMU 9.2.1（模拟评测环境）
-        run: |
-          sudo apt-get install -y qemu-system qemu-utils
-          qemu-system-riscv64 --version
-          qemu-system-loongarch64 --version
 
       - name: 清理隐藏目录（模拟评测系统过滤）
         run: |
@@ -105,6 +86,9 @@ jobs:
   fresh-clone-test:
     name: 干净克隆环境测试
     runs-on: ubuntu-latest
+    container:
+      image: docker.cnb.cool/starry-os/arceos-build:latest
+      options: --user root
 
     steps:
       - name: 模拟评测系统克隆项目
@@ -114,16 +98,6 @@ jobs:
           rm -rf starryos-test
           git clone --depth=1 ${{ github.repositoryUrl }} starryos-test
           cd starryos-test
-
-      - name: 安装依赖
-        run: |
-          cd /tmp/starryos-test
-          sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu gcc-loongarch64-linux-gnu qemu-system qemu-utils
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup target add riscv64gc-unknown-none-elf
-          rustup target add loongarch64-unknown-none-softfloat
 
       - name: 清理隐藏目录
         run: |
@@ -135,7 +109,6 @@ jobs:
       - name: 执行 make all
         run: |
           cd /tmp/starryos-test
-          export PATH="$HOME/.cargo/bin:$PATH"
           echo "=== 在干净环境中执行 make all ==="
           make all
 
