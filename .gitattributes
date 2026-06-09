@@ -1,20 +1,20 @@
-# Automatically detect text files and normalize line endings to LF
-* text=auto eol=lf
+# Automatically detect text files
+* text=auto
 
 # Explicitly specify text files
-*.rs text eol=lf
-*.toml text eol=lf
-*.md text eol=lf
+*.rs text
+*.toml text
+*.md text
 *.sh text eol=lf
-*.py text eol=lf
-*.json text eol=lf
-*.yaml text eol=lf
-*.yml text eol=lf
-*.txt text eol=lf
-*.c text eol=lf
-*.h text eol=lf
-*.cpp text eol=lf
-*.hpp text eol=lf
+*.py text
+*.json text
+*.yaml text
+*.yml text
+*.txt text
+*.c text
+*.h text
+*.cpp text
+*.hpp text
 
 # Binary files
 *.bin binary
@@ -24,6 +24,5 @@
 *.swp binary
 *.swo binary
 
-# Script files (keep executable)
-*.sh text eol=lf
-
+# Vendor directory: keep original line endings to avoid checksum mismatches
+vendor/ -text
