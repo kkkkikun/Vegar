@@ -55,7 +55,15 @@ prepare-hidden:
 		echo '' >> .cargo/config.toml; \
 		echo '[net]' >> .cargo/config.toml; \
 		echo 'git-fetch-with-cli = true' >> .cargo/config.toml; \
-		find vendor -name ".cargo-checksum.json" -delete 2>/dev/null || true; \
+		echo '' >> .cargo/config.toml; \
+		echo '[http]' >> .cargo/config.toml; \
+		echo 'check-revoke = false' >> .cargo/config.toml; \
+		for dir in vendor/*/; do \
+			checksum_file="$$dir.cargo-checksum.json"; \
+			if [ ! -f "$$checksum_file" ]; then \
+				echo '{"files":{}}' > "$$checksum_file"; \
+			fi; \
+		done; \
 	else \
 		if [ -f .cargo/config.toml ]; then \
 			rm -f .cargo/config.toml; \
