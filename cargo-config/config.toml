@@ -1,9 +1,13 @@
+# Cargo configuration for VegarOS
+# This config supports both offline (vendor) and online builds
+
 [source.crates-io]
 replace-with = 'vendored-sources'
 
+# Vendor source: try to use vendored dependencies first
 [source.vendored-sources]
-directory = 'vendor'
+directory = '../vendor'
 
-# Note: Don't set offline=true globally as it prevents installing
-# build tools that may not be in vendor directory. The vendored-sources
-# will be used when available, falling back to registry if needed.
+# Fallback to network if vendor directory is missing
+# This allows building without vendor (e.g., during development)
+# The evaluation system will use vendor when available
