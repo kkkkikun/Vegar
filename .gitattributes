@@ -24,5 +24,6 @@
 *.swp binary
 *.swo binary
 
-# Vendor directory: keep original line endings to avoid checksum mismatches
-vendor/ -text
+# Vendor directory: treat as binary to preserve exact content
+vendor/** -text
+vendor/ binary
