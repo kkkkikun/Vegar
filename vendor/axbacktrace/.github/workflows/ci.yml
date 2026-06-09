@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  RUST_BACKTRACE: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@cargo-hack
+
+      - name: Check format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo hack clippy --feature-powerset -- -D warnings
+      - name: Check docs
+        run: cargo doc --all-features --no-deps
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-none
+
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-none
+          - aarch64-unknown-none-softfloat
+
+          - riscv32imac-unknown-none-elf
+          - riscv64gc-unknown-linux-gnu
+          - riscv64gc-unknown-none-elf
+          - riscv64imac-unknown-none-elf
+
+          - loongarch64-unknown-linux-gnu
+          - loongarch64-unknown-none
+          - loongarch64-unknown-none-softfloat
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cargo-hack
+
+      - name: Build
+        run: cargo hack build --feature-powerset --target ${{ matrix.target }}

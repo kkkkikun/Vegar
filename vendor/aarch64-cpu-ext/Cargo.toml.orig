@@ -1,0 +1,14 @@
+[package]
+authors = ["zrufo747@outlook.com"]
+categories = ["embedded", "hardware-support", "no-std"]
+description = "Extended AArch64 CPU utilities and cache management operations"
+edition = "2024"
+keywords = ["aarch64", "arm64", "cache", "cpu", "no-std"]
+license = "MIT OR Apache-2.0"
+name = "aarch64-cpu-ext"
+repository = "https://github.com/drivercraft/aarch64-cpu-ext"
+version = "0.1.4"
+
+[dependencies]
+aarch64-cpu = "10"
+tock-registers = "0.10"

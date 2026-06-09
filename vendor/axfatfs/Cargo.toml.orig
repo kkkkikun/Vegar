@@ -1,0 +1,52 @@
+[package]
+name = "axfatfs"
+version = "0.1.0-pre.0"
+edition = "2021"
+description = "FAT filesystem library."
+authors = [
+    "Rafał Harabień <rafalh92@outlook.com>",
+    "Josen-B <baiqiaosen@gmail.com>",
+]
+repository = "https://github.com/arceos-hypervisor/axfatfs/"
+homepage = "https://github.com/arceos-hypervisor/axfatfs/"
+documentation = "https://arceos-hypervisor.github.io/axfatfs/"
+license = "MIT"
+readme = "README.md"
+keywords = ["fat", "filesystem", "no_std"]
+categories = ["filesystem"]
+rust-version = "1.65"
+exclude = ["resources/*"]
+
+[features]
+# Use Rust std library
+std = []
+# LFN (Long File Name) support
+lfn = []
+# Use dynamic allocation. When used without std please enable core_io/collections
+alloc = []
+# Full Unicode support. Disabling it reduces code size by avoiding Unicode-aware character case conversion
+unicode = []
+# Enable only error-level logging
+log_level_error = []
+# Enable logging levels warn and up
+log_level_warn = ["log_level_error"]
+# Enable logging levels info and up
+log_level_info = ["log_level_warn"]
+# Enable logging levels debug and up
+log_level_debug = ["log_level_info"]
+# Enable all logging levels: trace and up
+log_level_trace = ["log_level_debug"]
+
+# Default features
+default = ["chrono", "std", "alloc", "lfn", "unicode", "log_level_trace"]
+
+[dependencies]
+bitflags = { version = "2", default-features = false }
+log = { version = "0.4", default-features = false }
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+], optional = true }
+
+[dev-dependencies]
+env_logger = "0.9"
+fscommon = "0.1"

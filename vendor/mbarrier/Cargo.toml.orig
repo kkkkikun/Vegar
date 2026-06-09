@@ -1,0 +1,23 @@
+[package]
+authors = ["zrufo747@outlook.com"]
+categories = ["concurrency", "no-std"]
+description = "Cross-platform memory barrier implementations for Rust, inspired by Linux kernel"
+edition = "2024"
+keywords = ["memory", "barrier", "sync", "atomic", "kernel"]
+license = "MIT OR Apache-2.0"
+name = "mbarrier"
+repository = "https://github.com/drivercraft/mbarrier"
+version = "0.1.3"
+
+[features]
+default = ["smp"]
+# Enable SMP (Symmetric Multi-Processing) barriers
+smp = []
+
+[[example]]
+name = "usage"
+path = "examples/usage.rs"
+
+[[example]]
+name = "performance"
+path = "examples/performance.rs"

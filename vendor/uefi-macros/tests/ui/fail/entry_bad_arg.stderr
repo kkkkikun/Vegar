@@ -1,0 +1,5 @@
+error: Entry function must have no arguments
+ --> tests/ui/fail/entry_bad_arg.rs:6:9
+  |
+6 | fn main(_x: usize) -> Status {
+  |         ^^

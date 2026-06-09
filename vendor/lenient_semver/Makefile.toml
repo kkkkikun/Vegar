@@ -1,0 +1,37 @@
+[env]
+CARGO_MAKE_WORKSPACE_SKIP_MEMBERS = ["benchmark_runner"]
+
+[tasks.outdated]
+args = ["outdated", "--root-deps-only", "--exit-code", "0"]
+
+[tasks.bench]
+workspace = false
+command = "cargo"
+args = ["bench", "--package", "benchmark_runner", "--", "crate"]
+
+[tasks.bench-all]
+workspace = false
+command = "cargo"
+args = ["bench", "--package", "benchmark_runner"]
+
+[tasks.bench-clean-results]
+workspace = false
+command = "rm"
+args = ["-r", "benchmark_runner/target/criterion"]
+
+[tasks.ci]
+workspace = false
+run_task = { name = "ci-flow", fork = true }
+
+[tasks.readme]
+workspace = false
+command = "cargo"
+args = ["readme", "--output", "README.md"]
+
+[tasks.t]
+workspace = false
+run_task = { name = "test", fork = true }
+
+[tasks.r]
+workspace = false
+run_task = "readme"

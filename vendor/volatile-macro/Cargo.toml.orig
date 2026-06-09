@@ -1,0 +1,21 @@
+[package]
+name = "volatile-macro"
+version = "0.6.0"
+authors = ["Martin Kröning <mkroening@posteo.net>"]
+edition = "2021"
+description = "Procedural macros for the volatile crate."
+repository = "https://github.com/rust-osdev/volatile"
+license = "MIT OR Apache-2.0"
+keywords = ["volatile"]
+categories = ["no-std", "no-std::no-alloc"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+volatile = { version = "=0.6.0", path = "..", features = ["derive"] }

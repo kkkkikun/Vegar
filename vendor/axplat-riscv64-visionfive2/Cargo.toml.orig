@@ -1,0 +1,32 @@
+[package]
+name = "axplat-riscv64-visionfive2"
+version = "0.1.0-pre.2"
+description = " Implementation of `axplat` hardware abstraction layer for RISC-V VisionFive2 board"
+authors = ["朝倉水希 <asakuramizu111@gmail.com>"]
+edition = "2024"
+keywords = ["arceos", "os", "hal", "embedded", "riscv"]
+categories = ["embedded", "no-std", "hardware-support", "os"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Starry-OS/axplat-riscv64-visionfive2"
+
+[features]
+fp-simd = ["axcpu/fp-simd"]
+irq = ["axplat/irq", "dep:riscv_plic"]
+rtc = ["dep:riscv_goldfish"]
+smp = ["axplat/smp"]
+
+[dependencies]
+axconfig-macros = "0.2"
+axcpu = "0.3.0-preview.4"
+axplat = "0.3.1-pre.2"
+kspin = "0.1"
+lazyinit = "0.2"
+log = "0.4"
+riscv = "0.14"
+riscv_plic = { version = "0.2", optional = true }
+riscv_goldfish = { version = "0.1", optional = true }
+sbi-rt = { version = "0.0.3", features = ["legacy"] }
+uart_16550 = "0.4.0"
+
+[package.metadata.docs.rs]
+targets = ["riscv64gc-unknown-none-elf"]
