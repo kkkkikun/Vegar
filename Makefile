@@ -43,6 +43,19 @@ prepare-hidden:
 	@if [ -d cargo-config ] && [ ! -d .cargo ]; then \
 		cp -r cargo-config .cargo; \
 	fi
+	@# Configure vendor if available, otherwise use network
+	@if [ -d vendor ]; then \
+		mkdir -p .cargo; \
+		echo '[source.crates-io]' > .cargo/config.toml; \
+		echo 'replace-with = "vendored-sources"' >> .cargo/config.toml; \
+		echo '' >> .cargo/config.toml; \
+		echo '[source.vendored-sources]' >> .cargo/config.toml; \
+		echo 'directory = "vendor"' >> .cargo/config.toml; \
+	else \
+		if [ -f .cargo/config.toml ]; then \
+			rm -f .cargo/config.toml; \
+		fi \
+	fi
 	@# Clean old config when ARCH changes
 	@if [ -f make/.old_config_arch ]; then \
 		if [ "$(ARCH)" != "$$(cat make/.old_config_arch 2>/dev/null)" ]; then \
