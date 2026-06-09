@@ -1,4 +1,5 @@
 # Build Options
+export APP := $(PWD)
 export ARCH := riscv64
 export LOG := warn
 export DWARF := y
@@ -78,8 +79,27 @@ all:
 	@echo "Building LoongArch64 kernel (PCI bus, 1GB memory)..."
 	@$(MAKE) ARCH=loongarch64 BUS=pci build
 	@echo "Copying kernels for submission..."
-	@cp workspace_riscv64-qemu-virt.bin kernel-rv
-	@cp workspace_loongarch64-qemu-virt.bin kernel-la
+	@# Try multiple possible locations for the built kernel files
+	@if [ -f StarryOS_riscv64-qemu-virt.bin ]; then \
+		cp StarryOS_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f kernel/kernel_riscv64-qemu-virt.bin ]; then \
+		cp kernel/kernel_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f workspace_riscv64-qemu-virt.bin ]; then \
+		cp workspace_riscv64-qemu-virt.bin kernel-rv; \
+	else \
+		echo "ERROR: Cannot find RISC-V kernel binary"; \
+		exit 1; \
+	fi
+	@if [ -f StarryOS_loongarch64-qemu-virt.bin ]; then \
+		cp StarryOS_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f kernel/kernel_loongarch64-qemu-virt.bin ]; then \
+		cp kernel/kernel_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f workspace_loongarch64-qemu-virt.bin ]; then \
+		cp workspace_loongarch64-qemu-virt.bin kernel-la; \
+	else \
+		echo "ERROR: Cannot find LoongArch64 kernel binary"; \
+		exit 1; \
+	fi
 	@echo "✓ Build complete:"
 	@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
 	@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
@@ -128,21 +148,57 @@ ltp: ltp-rv
 ltp-rv:
 	@echo "=== Building RISC-V kernel (LTP test mode) ==="
 	@$(MAKE) ARCH=riscv64 BUS=mmio TEST_MODE=ltp build
-	@cp workspace_riscv64-qemu-virt.bin kernel-rv
+	@if [ -f StarryOS_riscv64-qemu-virt.bin ]; then \
+		cp StarryOS_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f kernel/kernel_riscv64-qemu-virt.bin ]; then \
+		cp kernel/kernel_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f workspace_riscv64-qemu-virt.bin ]; then \
+		cp workspace_riscv64-qemu-virt.bin kernel-rv; \
+	else \
+		echo "ERROR: Cannot find RISC-V kernel binary"; \
+		exit 1; \
+	fi
 	@echo "✓ LTP kernel ready: kernel-rv"
 
 ltp-la:
 	@echo "=== Building LoongArch64 kernel (LTP test mode) ==="
 	@$(MAKE) ARCH=loongarch64 BUS=pci TEST_MODE=ltp build
-	@cp workspace_loongarch64-qemu-virt.bin kernel-la
+	@if [ -f StarryOS_loongarch64-qemu-virt.bin ]; then \
+		cp StarryOS_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f kernel/kernel_loongarch64-qemu-virt.bin ]; then \
+		cp kernel/kernel_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f workspace_loongarch64-qemu-virt.bin ]; then \
+		cp workspace_loongarch64-qemu-virt.bin kernel-la; \
+	else \
+		echo "ERROR: Cannot find LoongArch64 kernel binary"; \
+		exit 1; \
+	fi
 	@echo "✓ LTP kernel ready: kernel-la"
 
 ltp-all:
 	@echo "=== Building both kernels (LTP test mode) ==="
 	@$(MAKE) ARCH=riscv64 BUS=mmio TEST_MODE=ltp build
 	@$(MAKE) ARCH=loongarch64 BUS=pci TEST_MODE=ltp build
-	@cp workspace_riscv64-qemu-virt.bin kernel-rv
-	@cp workspace_loongarch64-qemu-virt.bin kernel-la
+	@if [ -f StarryOS_riscv64-qemu-virt.bin ]; then \
+		cp StarryOS_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f kernel/kernel_riscv64-qemu-virt.bin ]; then \
+		cp kernel/kernel_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f workspace_riscv64-qemu-virt.bin ]; then \
+		cp workspace_riscv64-qemu-virt.bin kernel-rv; \
+	else \
+		echo "ERROR: Cannot find RISC-V kernel binary"; \
+		exit 1; \
+	fi
+	@if [ -f StarryOS_loongarch64-qemu-virt.bin ]; then \
+		cp StarryOS_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f kernel/kernel_loongarch64-qemu-virt.bin ]; then \
+		cp kernel/kernel_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f workspace_loongarch64-qemu-virt.bin ]; then \
+		cp workspace_loongarch64-qemu-virt.bin kernel-la; \
+	else \
+		echo "ERROR: Cannot find LoongArch64 kernel binary"; \
+		exit 1; \
+	fi
 	@echo "✓ LTP kernels ready:"
 	@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
 	@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
@@ -155,14 +211,30 @@ custom-rv:
 	@echo "=== Building RISC-V kernel (custom test mode) ==="
 	@echo "Edit TEST_GROUPS in src/init_custom.sh to select test groups"
 	@$(MAKE) ARCH=riscv64 BUS=mmio TEST_MODE=custom build
-	@cp workspace_riscv64-qemu-virt.bin kernel-rv
+	@if [ -f kernel/kernel_riscv64-qemu-virt.bin ]; then \
+		cp kernel/kernel_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f workspace_riscv64-qemu-virt.bin ]; then \
+		cp workspace_riscv64-qemu-virt.bin kernel-rv; \
+	else \
+		echo "ERROR: Cannot find RISC-V kernel binary"; \
+		exit 1; \
+	fi
 	@echo "✓ Custom kernel ready: kernel-rv"
 
 custom-la:
 	@echo "=== Building LoongArch64 kernel (custom test mode) ==="
 	@echo "Edit TEST_GROUPS in src/init_custom.sh to select test groups"
 	@$(MAKE) ARCH=loongarch64 BUS=pci TEST_MODE=custom build
-	@cp workspace_loongarch64-qemu-virt.bin kernel-la
+	@if [ -f StarryOS_loongarch64-qemu-virt.bin ]; then \
+		cp StarryOS_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f kernel/kernel_loongarch64-qemu-virt.bin ]; then \
+		cp kernel/kernel_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f workspace_loongarch64-qemu-virt.bin ]; then \
+		cp workspace_loongarch64-qemu-virt.bin kernel-la; \
+	else \
+		echo "ERROR: Cannot find LoongArch64 kernel binary"; \
+		exit 1; \
+	fi
 	@echo "✓ Custom kernel ready: kernel-la"
 
 custom-all:
@@ -170,8 +242,26 @@ custom-all:
 	@echo "Edit TEST_GROUPS in src/init_custom.sh to select test groups"
 	@$(MAKE) ARCH=riscv64 BUS=mmio TEST_MODE=custom build
 	@$(MAKE) ARCH=loongarch64 BUS=pci TEST_MODE=custom build
-	@cp workspace_riscv64-qemu-virt.bin kernel-rv
-	@cp workspace_loongarch64-qemu-virt.bin kernel-la
+	@if [ -f StarryOS_riscv64-qemu-virt.bin ]; then \
+		cp StarryOS_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f kernel/kernel_riscv64-qemu-virt.bin ]; then \
+		cp kernel/kernel_riscv64-qemu-virt.bin kernel-rv; \
+	elif [ -f workspace_riscv64-qemu-virt.bin ]; then \
+		cp workspace_riscv64-qemu-virt.bin kernel-rv; \
+	else \
+		echo "ERROR: Cannot find RISC-V kernel binary"; \
+		exit 1; \
+	fi
+	@if [ -f StarryOS_loongarch64-qemu-virt.bin ]; then \
+		cp StarryOS_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f kernel/kernel_loongarch64-qemu-virt.bin ]; then \
+		cp kernel/kernel_loongarch64-qemu-virt.bin kernel-la; \
+	elif [ -f workspace_loongarch64-qemu-virt.bin ]; then \
+		cp workspace_loongarch64-qemu-virt.bin kernel-la; \
+	else \
+		echo "ERROR: Cannot find LoongArch64 kernel binary"; \
+		exit 1; \
+	fi
 	@echo "✓ Custom kernels ready:"
 	@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
 	@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
