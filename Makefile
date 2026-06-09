@@ -52,6 +52,10 @@ prepare-hidden:
 		echo '' >> .cargo/config.toml; \
 		echo '[source.vendored-sources]' >> .cargo/config.toml; \
 		echo 'directory = "vendor"' >> .cargo/config.toml; \
+		echo '' >> .cargo/config.toml; \
+		echo '[net]' >> .cargo/config.toml; \
+		echo 'git-fetch-with-cli = true' >> .cargo/config.toml; \
+		find vendor -name ".cargo-checksum.json" -delete 2>/dev/null || true; \
 	else \
 		if [ -f .cargo/config.toml ]; then \
 			rm -f .cargo/config.toml; \
