@@ -22,5 +22,5 @@ endif
 # Cargo binutils (optional, still try to install if network available)
 ifeq ($(shell cargo install --list 2>/dev/null | grep cargo-binutils),)
   $(info Installing cargo-binutils...)
-  $(shell cargo install cargo-binutils 2>&1 | grep -v "^warning:" | grep -v "^   " || true)
+  $(shell cargo install cargo-binutils >/dev/null 2>&1 || true)
 endif
