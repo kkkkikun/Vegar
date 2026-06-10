@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "566fc4020cf9a77ab5696bb095373a46ccfaf8f9"
+  },
+  "path_in_vcs": "crates/bare-test-macros"
+}

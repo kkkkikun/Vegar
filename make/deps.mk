@@ -1,23 +1,25 @@
-# Necessary dependencies for the build system
+# Build dependencies for OSComp evaluation environment
+# In offline environments, we build tools from included source code
 
-# When installing tools, we need network access even if vendor is configured
-# Use CARGO_NET_GIT_FETCH_WITH_CLI=true and --index to bypass vendor-only mode
-CARGO_INSTALL_FLAGS := --index https://github.com/rust-lang/crates.io-index
+# Path to tools directory
+TOOLS_DIR := $(CURDIR)/../tools
+TOOLS_BIN_DIR := $(TOOLS_DIR)/target/release
 
-# Tool to parse information about the target package
-ifeq ($(shell cargo axplat --version 2>/dev/null),)
-  $(info Installing cargo-axplat...)
-  $(shell cargo install $(CARGO_INSTALL_FLAGS) cargo-axplat)
+# Add tools bin directory to PATH
+export PATH := $(TOOLS_BIN_DIR):$(PATH)
+
+# We only need axconfig-gen now (cargo-axplat is not required with direct vendor paths)
+ifeq ($(wildcard $(TOOLS_BIN_DIR)/axconfig-gen),)
+  # axconfig-gen not built yet, build it
+  $(info Build tool not found, building axconfig-gen from source...)
+  $(shell $(MAKE) -C $(TOOLS_DIR) axconfig-gen > /dev/null 2>&1)
+  $(if $(wildcard $(TOOLS_BIN_DIR)/axconfig-gen),,\
+    $(info axconfig-gen: OK),\
+    $(error Failed to build axconfig-gen. Please check tools/ directory))
 endif
 
-# Tool to generate platform configuration files
-ifeq ($(shell axconfig-gen --version 2>/dev/null),)
-  $(info Installing axconfig-gen...)
-  $(shell cargo install $(CARGO_INSTALL_FLAGS) axconfig-gen)
-endif
-
-# Cargo binutils
-ifeq ($(shell cargo install --list | grep cargo-binutils),)
+# Cargo binutils (optional, still try to install if network available)
+ifeq ($(shell cargo install --list 2>/dev/null | grep cargo-binutils),)
   $(info Installing cargo-binutils...)
-  $(shell cargo install $(CARGO_INSTALL_FLAGS) cargo-binutils)
+  $(shell cargo install cargo-binutils 2>&1 | grep -v "^warning:" | grep -v "^   " || true)
 endif

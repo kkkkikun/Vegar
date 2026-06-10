@@ -6,14 +6,28 @@ else
   cargo_manifest_dir := $(CURDIR)
 endif
 
+# Use locally built axconfig-gen if available
+AXCONFIG_GEN := $(shell \
+  if [ -x "$(CURDIR)/../tools/target/release/axconfig-gen" ]; then \
+    echo "$(CURDIR)/../tools/target/release/axconfig-gen"; \
+  elif which axconfig-gen >/dev/null 2>&1; then \
+    echo "axconfig-gen"; \
+  else \
+    echo ""; \
+  fi)
+
+ifeq ($(AXCONFIG_GEN),)
+  $(error axconfig-gen not found. Please run 'make -C tools' first)
+endif
+
 define resolve_config
   $(if $(wildcard $(PLAT_CONFIG)),\
     $(PLAT_CONFIG),\
-    $(shell cargo axplat info -C $(cargo_manifest_dir) -c $(PLAT_PACKAGE)))
+    $(wildcard $(CURDIR)/../vendor/$(PLAT_PACKAGE)/axconfig.toml))
 endef
 
 define validate_config
-  $(eval package := $(shell axconfig-gen $(PLAT_CONFIG) -r package 2>/dev/null)) \
+  $(eval package := $(shell $(AXCONFIG_GEN) $(PLAT_CONFIG) -r package 2>/dev/null)) \
   $(if $(strip $(package)),,$(error PLAT_CONFIG=$(PLAT_CONFIG) is not a valid platform configuration file)) \
   $(if $(filter "$(PLAT_PACKAGE)",$(package)),,\
     $(error `PLAT_PACKAGE` field mismatch: expected $(PLAT_PACKAGE), got $(package)))
@@ -42,12 +56,12 @@ else
   PLAT_PACKAGE := $(MYPLAT)
   PLAT_CONFIG := $(strip $(call resolve_config))
   ifeq ($(wildcard $(PLAT_CONFIG)),)
-    $(error "MYPLAT=$(MYPLAT) is not a valid platform package name")
+    $(error "MYPLAT=$(MYPLAT)" is not a valid platform package name)
   endif
   $(call validate_config)
 
   # Read the architecture name from the configuration file
-  _arch := $(patsubst "%",%,$(shell axconfig-gen $(PLAT_CONFIG) -r arch))
+  _arch := $(patsubst "%",%,$(shell $(AXCONFIG_GEN) $(PLAT_CONFIG) -r arch))
   ifeq ($(origin ARCH),command line)
     ifneq ($(ARCH),$(_arch))
       $(error "ARCH=$(ARCH)" is not compatible with "MYPLAT=$(MYPLAT)")
@@ -56,4 +70,4 @@ else
   ARCH := $(_arch)
 endif
 
-PLAT_NAME := $(patsubst "%",%,$(shell axconfig-gen $(PLAT_CONFIG) -r platform))
+PLAT_NAME := $(patsubst "%",%,$(shell $(AXCONFIG_GEN) $(PLAT_CONFIG) -r platform))
