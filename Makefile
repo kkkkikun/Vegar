@@ -100,11 +100,12 @@ prepare-hidden:
 			echo "Using fallback toolchain (nightly-2025-05-20) — setting RUSTFLAGS for feature compatibility..."; \
 		fi; \
 	fi
-	@# Verify required build targets are installed
+	@# Verify required build targets are installed for the current toolchain.
+	@# Uses rustup's native path resolution (handles varying HOME/RUSTUP_HOME).
 	@for target in riscv64gc-unknown-none-elf loongarch64-unknown-none-softfloat; do \
-		rustlib="$$HOME/.rustup/toolchains/nightly-2025-05-20-x86_64-unknown-linux-gnu/lib/rustlib/$$target"; \
-		if [ ! -d "$$rustlib" ]; then \
-			echo "ERROR: Required target '$$target' not installed for nightly-2025-05-20."; \
+		tc_sysroot=$$(rustup run $(RUSTUP_TOOLCHAIN) rustc --print sysroot 2>/dev/null); \
+		if [ ! -d "$$tc_sysroot/lib/rustlib/$$target" ]; then \
+			echo "ERROR: Required target '$$target' not installed for $(RUSTUP_TOOLCHAIN)."; \
 			exit 1; \
 		fi \
 	done
