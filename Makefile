@@ -39,7 +39,11 @@ endif
 # contains nightly-2025-05-20 instead. In CI (with network) the correct
 # toolchain is installed normally; in the offline eval environment we
 # fall back to the Docker's pre-installed nightly.
+#
+# Note: GitHub Actions Docker containers may set HOME to /github/home,
+# so we explicitly set RUSTUP_HOME to the Docker image's default.
 # =========================================================================
+export RUSTUP_HOME := $(or ${RUSTUP_HOME},/root/.rustup)
 RUSTUP_TOOLCHAIN := $(shell \
   if rustup toolchain list 2>/dev/null | grep -qF "nightly-2026-02-25"; then \
     echo "nightly-2026-02-25"; \
