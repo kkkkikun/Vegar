@@ -63,11 +63,6 @@ prepare-hidden:
 		echo '' >> .cargo/config.toml; \
 		echo '[http]' >> .cargo/config.toml; \
 		echo 'check-revoke = false' >> .cargo/config.toml; \
-		for dir in vendor/*/; do \
-			if [ -f "$${dir}cargo-checksum.json" ]; then \
-				cp "$${dir}cargo-checksum.json" "$${dir}.cargo-checksum.json"; \
-			fi; \
-		done; \
 	else \
 		if [ -f .cargo/config.toml ]; then \
 			rm -f .cargo/config.toml; \

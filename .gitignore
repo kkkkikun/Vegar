@@ -10,6 +10,8 @@
 /kernel-rv
 /kernel-la
 /.cargo/
+/tools/.cargo/
+/tools/vendor/
 !cargo-config/
 !vendor/
 /.crates*

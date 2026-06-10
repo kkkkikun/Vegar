@@ -1,5 +1,0 @@
-error: Entry function should not be generic
- --> tests/ui/fail/entry_bad_generic.rs:6:9
-  |
-6 | fn main<T>() -> Status {
-  |         ^

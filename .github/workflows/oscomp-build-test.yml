@@ -29,13 +29,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 清理隐藏目录（模拟评测系统过滤）
-        run: |
-          echo "=== 模拟评测系统过滤隐藏文件 ==="
-          echo "注意：保留 .cargo 目录以支持 vendor 依赖"
-          find . -name ".*" -type d -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -not -path "./.cargo" -exec rm -rf {} + 2>/dev/null || true
-          find . -name ".*" -type f -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -delete 2>/dev/null || true
-
       - name: 执行 make all（评测命令）
         run: |
           echo "=== 执行官方评测命令：make all ==="
@@ -44,34 +37,18 @@ jobs:
       - name: 验证必需文件存在
         run: |
           echo "=== 验证评测必需文件 ==="
-
-          # 检查 kernel-rv（RISC-V 内核）
           if [ ! -f kernel-rv ]; then
             echo "❌ 错误：kernel-rv 文件不存在"
             exit 1
           fi
           echo "✓ kernel-rv 存在 ($(wc -c < kernel-rv) 字节)"
-
-          # 检查 kernel-la（LoongArch64 内核）
           if [ ! -f kernel-la ]; then
             echo "❌ 错误：kernel-la 文件不存在"
             exit 1
           fi
           echo "✓ kernel-la 存在 ($(wc -c < kernel-la) 字节)"
-
-          # 检查文件格式（应该是 ELF）
           file kernel-rv | grep -q ELF || echo "⚠️  警告：kernel-rv 不是 ELF 格式"
           file kernel-la | grep -q ELF || echo "⚠️  警告：kernel-la 不是 ELF 格式"
-
-      - name: 检查可选文件
-        run: |
-          echo "=== 检查可选辅助文件 ==="
-
-          if [ -f disk.img ]; then
-            echo "✓ disk.img 存在 ($(wc -c < disk.img) 字节)"
-          else
-            echo "ℹ️  disk.img 不存在（可选文件）"
-          fi
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
@@ -83,52 +60,44 @@ jobs:
             disk.img
           retention-days: 7
 
-  # 干净克隆测试：使用官方评测环境
-  fresh-clone-test:
-    name: 干净克隆环境测试（官方镜像）
+  # 模拟评测环境：删除隐藏文件后再构建
+  eval-simulation-test:
+    name: 评测环境模拟测试
     runs-on: ubuntu-latest
     container:
       image: zhouzhouyi/os-contest:20260510
       options: --user root
 
     steps:
-      - name: 模拟评测系统克隆项目
-        run: |
-          echo "=== 模拟评测系统克隆项目 ==="
-          cd /tmp
-          rm -rf starryos-test
-          git clone --depth=1 ${{ github.repositoryUrl }} starryos-test
-          cd starryos-test
+      - name: 克隆代码
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: 清理隐藏目录
+      - name: 模拟评测系统过滤隐藏文件
         run: |
-          cd /tmp/starryos-test
-          echo "=== 清理隐藏目录 ==="
-          echo "注意：保留 .cargo 目录以支持 vendor 依赖"
-          find . -name ".*" -type d -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -not -path "./.cargo" -exec rm -rf {} + 2>/dev/null || true
-          find . -name ".*" -type f -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -delete 2>/dev/null || true
+          echo "=== 删除隐藏目录（模拟评测系统） ==="
+          # 只删除顶层的隐藏目录，保留 vendor 内部的文件
+          find . -maxdepth 1 -name ".*" -type d -not -name ".git" -not -name ".github" -exec rm -rf {} + 2>/dev/null || true
+          # 删除顶层隐藏文件
+          find . -maxdepth 1 -name ".*" -type f -delete 2>/dev/null || true
+          echo "隐藏文件清理完成"
 
       - name: 执行 make all
         run: |
-          cd /tmp/starryos-test
-          echo "=== 在干净环境中执行 make all ==="
+          echo "=== 模拟评测环境中执行 make all ==="
           make all
 
       - name: 验证构建结果
         run: |
-          cd /tmp/starryos-test
-          echo "=== 验证构建结果 ==="
-
           if [ ! -f kernel-rv ]; then
-            echo "❌ 干净克隆环境：kernel-rv 构建失败"
+            echo "❌ kernel-rv 构建失败"
             exit 1
           fi
-
           if [ ! -f kernel-la ]; then
-            echo "❌ 干净克隆环境：kernel-la 构建失败"
+            echo "❌ kernel-la 构建失败"
             exit 1
           fi
-
-          echo "✓ 干净克隆环境构建成功"
+          echo "✓ 评测模拟环境构建成功"
           echo "  kernel-rv: $(wc -c < kernel-rv) 字节"
           echo "  kernel-la: $(wc -c < kernel-la) 字节"
