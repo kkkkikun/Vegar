@@ -73,6 +73,11 @@ prepare-hidden:
 			rm -f .cargo/config.toml; \
 		fi \
 	fi
+	@# Ensure build tools are available
+	@if [ ! -x tools/target/release/axconfig-gen ]; then \
+		echo "Building axconfig-gen tool..."; \
+		$(MAKE) -C tools axconfig-gen; \
+	fi
 	@# Clean old config when ARCH changes
 	@if [ -f make/.old_config_arch ]; then \
 		if [ "$(ARCH)" != "$$(cat make/.old_config_arch 2>/dev/null)" ]; then \

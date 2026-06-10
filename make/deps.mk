@@ -1,5 +1,5 @@
 # Build dependencies for OSComp evaluation environment
-# In offline environments, we build tools from included source code
+# Tools must be available before platform.mk is included
 
 # Path to tools directory
 TOOLS_DIR := $(CURDIR)/../tools
@@ -8,14 +8,13 @@ TOOLS_BIN_DIR := $(TOOLS_DIR)/target/release
 # Add tools bin directory to PATH
 export PATH := $(TOOLS_BIN_DIR):$(PATH)
 
-# We only need axconfig-gen now (cargo-axplat is not required with direct vendor paths)
-# Check if tool exists, if not build it
-BUILD_TOOL_SCRIPT := $(CURDIR)/../scripts/ensure-tools.sh
-
+# Ensure axconfig-gen is built BEFORE platform.mk is included
+# This is checked at Makefile parse time, so we build synchronously
 ifeq ($(wildcard $(TOOLS_BIN_DIR)/axconfig-gen),)
-  # Tool doesn't exist, ensure it's built
-  $(if $(shell $(BUILD_TOOL_SCRIPT) 2>&1),,\
-    $(info Tool build completed),\
+  $(info Building axconfig-gen tool...)
+  $(shell $(MAKE) -C $(TOOLS_DIR) axconfig-gen >/dev/null 2>&1 || $(MAKE) -C $(TOOLS_DIR) axconfig-gen)
+  $(if $(wildcard $(TOOLS_BIN_DIR)/axconfig-gen),,\
+    $(info axconfig-gen: OK),\
     $(error Failed to build axconfig-gen. Please check tools/ directory))
 endif
 
