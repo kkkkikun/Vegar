@@ -32,8 +32,9 @@ jobs:
       - name: 清理隐藏目录（模拟评测系统过滤）
         run: |
           echo "=== 模拟评测系统过滤隐藏文件 ==="
-          find . -name ".*" -type d -not -path "./.git/*" -not -path "./.github/*" -exec rm -rf {} + 2>/dev/null || true
-          find . -name ".*" -type f -not -path "./.git/*" -not -path "./.github/*" -delete 2>/dev/null || true
+          echo "注意：保留 .cargo 目录以支持 vendor 依赖"
+          find . -name ".*" -type d -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -not -path "./.cargo" -exec rm -rf {} + 2>/dev/null || true
+          find . -name ".*" -type f -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -delete 2>/dev/null || true
 
       - name: 执行 make all（评测命令）
         run: |
@@ -103,8 +104,9 @@ jobs:
         run: |
           cd /tmp/starryos-test
           echo "=== 清理隐藏目录 ==="
-          find . -name ".*" -type d -not -path "./.git/*" -exec rm -rf {} + 2>/dev/null || true
-          find . -name ".*" -type f -not -path "./.git/*" -delete 2>/dev/null || true
+          echo "注意：保留 .cargo 目录以支持 vendor 依赖"
+          find . -name ".*" -type d -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -not -path "./.cargo" -exec rm -rf {} + 2>/dev/null || true
+          find . -name ".*" -type f -not -path "./.git/*" -not -path "./.github/*" -not -path "./.cargo/*" -delete 2>/dev/null || true
 
       - name: 执行 make all
         run: |

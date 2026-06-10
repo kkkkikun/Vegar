@@ -41,6 +41,11 @@ endif
 .PHONY: prepare-hidden
 prepare-hidden:
 	@# Setup cargo config for offline build
+	@# First, try to restore from 'cargo' directory (non-hidden, survives filtering)
+	@if [ -d cargo ] && [ ! -d .cargo ]; then \
+		cp -r cargo .cargo; \
+	fi
+	@# Fallback to cargo-config directory
 	@if [ -d cargo-config ] && [ ! -d .cargo ]; then \
 		cp -r cargo-config .cargo; \
 	fi
