@@ -59,9 +59,8 @@ prepare-hidden:
 		echo '[http]' >> .cargo/config.toml; \
 		echo 'check-revoke = false' >> .cargo/config.toml; \
 		for dir in vendor/*/; do \
-			checksum_file="$$dir.cargo-checksum.json"; \
-			if [ ! -f "$$checksum_file" ]; then \
-				echo '{"files":{}}' > "$$checksum_file"; \
+			if [ -f "$${dir}cargo-checksum.json" ]; then \
+				cp "$${dir}cargo-checksum.json" "$${dir}.cargo-checksum.json"; \
 			fi; \
 		done; \
 	else \
