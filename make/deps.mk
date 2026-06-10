@@ -9,12 +9,13 @@ TOOLS_BIN_DIR := $(TOOLS_DIR)/target/release
 export PATH := $(TOOLS_BIN_DIR):$(PATH)
 
 # We only need axconfig-gen now (cargo-axplat is not required with direct vendor paths)
+# Check if tool exists, if not build it
+BUILD_TOOL_SCRIPT := $(CURDIR)/../scripts/ensure-tools.sh
+
 ifeq ($(wildcard $(TOOLS_BIN_DIR)/axconfig-gen),)
-  # axconfig-gen not built yet, build it
-  $(info Build tool not found, building axconfig-gen from source...)
-  $(shell $(MAKE) -C $(TOOLS_DIR) axconfig-gen > /dev/null 2>&1)
-  $(if $(wildcard $(TOOLS_BIN_DIR)/axconfig-gen),,\
-    $(info axconfig-gen: OK),\
+  # Tool doesn't exist, ensure it's built
+  $(if $(shell $(BUILD_TOOL_SCRIPT) 2>&1),,\
+    $(info Tool build completed),\
     $(error Failed to build axconfig-gen. Please check tools/ directory))
 endif
 
