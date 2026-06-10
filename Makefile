@@ -41,9 +41,13 @@ endif
 # fall back to the Docker's pre-installed nightly.
 #
 # Note: GitHub Actions Docker containers may set HOME to /github/home,
-# so we explicitly set RUSTUP_HOME to the Docker image's default.
+# so we auto-detect RUSTUP_HOME by checking multiple paths.
 # =========================================================================
-export RUSTUP_HOME := $(or ${RUSTUP_HOME},/root/.rustup)
+export RUSTUP_HOME := $(shell \
+  if [ -n "${RUSTUP_HOME}" ]; then echo "${RUSTUP_HOME}"; \
+  elif [ -d "$${HOME}/.rustup" ]; then echo "$${HOME}/.rustup"; \
+  elif [ -d /root/.rustup ]; then echo "/root/.rustup"; \
+  else echo "$${HOME}/.rustup"; fi)
 RUSTUP_TOOLCHAIN := $(shell \
   if rustup toolchain list 2>/dev/null | grep -qF "nightly-2026-02-25"; then \
     echo "nightly-2026-02-25"; \
