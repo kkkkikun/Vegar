@@ -18,8 +18,7 @@ ifeq ($(wildcard $(TOOLS_BIN_DIR)/axconfig-gen),)
     $(error Failed to build axconfig-gen. Please check tools/ directory))
 endif
 
-# Cargo binutils (optional, still try to install if network available)
+# Cargo binutils check (pre-installed in Docker image, skip if not available)
 ifeq ($(shell cargo install --list 2>/dev/null | grep cargo-binutils),)
-  $(info Installing cargo-binutils...)
-  $(shell cargo install cargo-binutils >/dev/null 2>&1 || true)
+  $(info Note: cargo-binutils not found. Object copy/size tools fall back to system versions.)
 endif

@@ -34,6 +34,29 @@ APP_FEATURES += custom
 endif
 
 # =========================================================================
+# Rust toolchain detection for offline evaluation environment.
+# The project requires nightly-2026-02-25, but the official Docker image
+# contains nightly-2025-05-20 instead. In CI (with network) the correct
+# toolchain is installed normally; in the offline eval environment we
+# fall back to the Docker's pre-installed nightly.
+# =========================================================================
+RUSTUP_TOOLCHAIN := $(shell \
+  if rustup toolchain list 2>/dev/null | grep -qF "nightly-2026-02-25"; then \
+    echo "nightly-2026-02-25"; \
+  elif rustup toolchain list 2>/dev/null | grep -qF "nightly-2025-05-20"; then \
+    echo "nightly-2025-05-20"; \
+  fi)
+export RUSTUP_TOOLCHAIN
+
+# When using the fallback toolchain (nightly-2025-05-20), enable unstabilized
+# library features that are required by vendored crates but not yet stable.
+# These features ARE stable in the project's default toolchain (nightly-2026-02-25).
+ifneq ($(filter nightly-2025-05-20,$(RUSTUP_TOOLCHAIN)),)
+  export RUSTFLAGS := -Z crate-attr=feature(unsigned_signed_diff) -Z crate-attr=feature(maybe_uninit_slice)
+endif
+
+
+# =========================================================================
 # Fix for hidden directories in competition environment
 # The evaluation system filters out hidden files/directories during clone.
 # We rename them to non-hidden names before build.
@@ -49,7 +72,7 @@ prepare-hidden:
 	@if [ -d cargo-config ] && [ ! -d .cargo ]; then \
 		cp -r cargo-config .cargo; \
 	fi
-	@# Configure vendor if available, otherwise use network
+	@# Configure vendor for fully offline build
 	@if [ -d vendor ]; then \
 		mkdir -p .cargo; \
 		echo '[source.crates-io]' > .cargo/config.toml; \
@@ -59,6 +82,7 @@ prepare-hidden:
 		echo 'directory = "vendor"' >> .cargo/config.toml; \
 		echo '' >> .cargo/config.toml; \
 		echo '[net]' >> .cargo/config.toml; \
+		echo 'offline = true' >> .cargo/config.toml; \
 		echo 'git-fetch-with-cli = true' >> .cargo/config.toml; \
 		echo '' >> .cargo/config.toml; \
 		echo '[http]' >> .cargo/config.toml; \
@@ -68,6 +92,22 @@ prepare-hidden:
 			rm -f .cargo/config.toml; \
 		fi \
 	fi
+	@# If the project-specified nightly is not available (offline
+	@# evaluation environment), use RUSTFLAGS to add feature gates for
+	@# unstable APIs that the fallback nightly does not yet stabilize.
+	@if ! rustup toolchain list 2>/dev/null | grep -qF "nightly-2026-02-25"; then \
+		if rustup toolchain list 2>/dev/null | grep -qF "nightly-2025-05-20"; then \
+			echo "Using fallback toolchain (nightly-2025-05-20) — setting RUSTFLAGS for feature compatibility..."; \
+		fi; \
+	fi
+	@# Verify required build targets are installed
+	@for target in riscv64gc-unknown-none-elf loongarch64-unknown-none-softfloat; do \
+		rustlib="$$HOME/.rustup/toolchains/nightly-2025-05-20-x86_64-unknown-linux-gnu/lib/rustlib/$$target"; \
+		if [ ! -d "$$rustlib" ]; then \
+			echo "ERROR: Required target '$$target' not installed for nightly-2025-05-20."; \
+			exit 1; \
+		fi \
+	done
 	@# Ensure build tools are available
 	@if [ ! -x tools/target/release/axconfig-gen ]; then \
 		echo "Building axconfig-gen tool..."; \
@@ -79,7 +119,6 @@ prepare-hidden:
 			rm -f .axconfig.toml; \
 		fi \
 	fi
-
 default: prepare-hidden build
 
 build: prepare-hidden

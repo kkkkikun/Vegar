@@ -5,6 +5,7 @@ replace-with = "vendored-sources"
 directory = "vendor"
 
 [net]
+offline = true
 git-fetch-with-cli = true
 
 [http]
