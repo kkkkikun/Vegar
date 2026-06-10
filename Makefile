@@ -95,23 +95,18 @@ all:
 	@echo "Building LoongArch64 kernel (PCI bus, 1GB memory)..."
 	@$(MAKE) ARCH=loongarch64 BUS=pci build
 	@echo "Copying kernels for submission..."
-	@# Try multiple possible locations for the built kernel files
-	@if [ -f StarryOS_riscv64-qemu-virt.bin ]; then \
-		cp StarryOS_riscv64-qemu-virt.bin kernel-rv; \
-	elif [ -f kernel/kernel_riscv64-qemu-virt.bin ]; then \
-		cp kernel/kernel_riscv64-qemu-virt.bin kernel-rv; \
-	elif [ -f workspace_riscv64-qemu-virt.bin ]; then \
-		cp workspace_riscv64-qemu-virt.bin kernel-rv; \
+	@# The output filename depends on the repo name (StarryOS_*, Vegar_*, etc.)
+	@# Use glob pattern to find any matching binary
+	@_rv=$$(ls *_riscv64-qemu-virt.bin 2>/dev/null | head -1); \
+	if [ -n "$$_rv" ]; then \
+		cp "$$_rv" kernel-rv; \
 	else \
 		echo "ERROR: Cannot find RISC-V kernel binary"; \
 		exit 1; \
 	fi
-	@if [ -f StarryOS_loongarch64-qemu-virt.bin ]; then \
-		cp StarryOS_loongarch64-qemu-virt.bin kernel-la; \
-	elif [ -f kernel/kernel_loongarch64-qemu-virt.bin ]; then \
-		cp kernel/kernel_loongarch64-qemu-virt.bin kernel-la; \
-	elif [ -f workspace_loongarch64-qemu-virt.bin ]; then \
-		cp workspace_loongarch64-qemu-virt.bin kernel-la; \
+	@_la=$$(ls *_loongarch64-qemu-virt.bin 2>/dev/null | head -1); \
+	if [ -n "$$_la" ]; then \
+		cp "$$_la" kernel-la; \
 	else \
 		echo "ERROR: Cannot find LoongArch64 kernel binary"; \
 		exit 1; \
