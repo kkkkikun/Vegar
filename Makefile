@@ -135,33 +135,49 @@ build: prepare-hidden
 # === OSComp submission entry: build both arch kernels ===
 # Uses bin format since QEMU -kernel loads raw binaries at correct address.
 # The test image (provided by competition) is the first block device and gets
-# mounted as root by axfs-ng. We do NOT produce disk.img to avoid shadowing it.
+# mounted as root by axfs-ng. disk.img / disk-la.img are optional auxiliary
+# data disks (512MB) for LTP tests that need large block devices (>=300MB).
 all:
-	@echo "=== Building OSComp 2026 Submission ==="
-	@echo "Building RISC-V kernel (MMIO bus, 1GB memory)..."
-	@$(MAKE) ARCH=riscv64 BUS=mmio build
-	@echo "Building LoongArch64 kernel (PCI bus, 1GB memory)..."
-	@$(MAKE) ARCH=loongarch64 BUS=pci build
-	@echo "Copying kernels for submission..."
-	@# The output filename depends on the repo name (StarryOS_*, Vegar_*, etc.)
-	@# Use glob pattern to find any matching binary
-	@_rv=$$(ls *_riscv64-qemu-virt.bin 2>/dev/null | head -1); \
-	if [ -n "$$_rv" ]; then \
-		cp "$$_rv" kernel-rv; \
-	else \
-		echo "ERROR: Cannot find RISC-V kernel binary"; \
-		exit 1; \
-	fi
-	@_la=$$(ls *_loongarch64-qemu-virt.bin 2>/dev/null | head -1); \
-	if [ -n "$$_la" ]; then \
-		cp "$$_la" kernel-la; \
-	else \
-		echo "ERROR: Cannot find LoongArch64 kernel binary"; \
-		exit 1; \
-	fi
-	@echo "✓ Build complete:"
-	@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
-	@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
+		@echo "=== Building OSComp 2026 Submission ==="
+		@echo "Building RISC-V kernel (MMIO bus, 1GB memory)..."
+		@$(MAKE) ARCH=riscv64 BUS=mmio build
+		@echo "Building LoongArch64 kernel (PCI bus, 1GB memory)..."
+		@$(MAKE) ARCH=loongarch64 BUS=pci build
+		@echo "Copying kernels for submission..."
+		@# The output filename depends on the repo name (StarryOS_*, Vegar_*, etc.)
+		@# Use glob pattern to find any matching binary
+		@_rv=$$(ls *_riscv64-qemu-virt.bin 2>/dev/null | head -1); \
+		if [ -n "$$_rv" ]; then \
+			cp "$$_rv" kernel-rv; \
+		else \
+			echo "ERROR: Cannot find RISC-V kernel binary"; \
+			exit 1; \
+		fi
+		@_la=$$(ls *_loongarch64-qemu-virt.bin 2>/dev/null | head -1); \
+		if [ -n "$$_la" ]; then \
+			cp "$$_la" kernel-la; \
+		else \
+			echo "ERROR: Cannot find LoongArch64 kernel binary"; \
+			exit 1; \
+		fi
+		@echo "Creating auxiliary data disks (512MB each) for LTP tests..."
+		@if [ ! -f disk.img ]; then \
+			dd if=/dev/zero of=disk.img bs=1M count=512 2>/dev/null; \
+			echo "  disk.img created (512MB)"; \
+		else \
+			echo "  disk.img already exists"; \
+		fi
+		@if [ ! -f disk-la.img ]; then \
+			dd if=/dev/zero of=disk-la.img bs=1M count=512 2>/dev/null; \
+			echo "  disk-la.img created (512MB)"; \
+		else \
+			echo "  disk-la.img already exists"; \
+		fi
+		@echo "✓ Build complete:"
+		@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
+		@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
+		@echo "  disk.img ($(shell wc -c < disk.img 2>/dev/null) bytes)"
+		@echo "  disk-la.img ($(shell wc -c < disk-la.img 2>/dev/null) bytes)"
 
 ROOTFS_URL = https://github.com/Starry-OS/rootfs/releases/download/20260214
 ROOTFS_IMG = rootfs-$(ARCH).img
