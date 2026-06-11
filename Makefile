@@ -100,15 +100,6 @@ prepare-hidden:
 			rm -f .cargo/config.toml; \
 		fi \
 	fi
-	@# Add [patch.crates-io] to .cargo/config.toml so that even with
-	@# source replacement, the local patch takes precedence.
-	@if [ -d patches/axfs-ng ]; then \
-		echo '' >> .cargo/config.toml; \
-		echo '# Override axfs-ng with local patch (dual-disk block device fix).' >> .cargo/config.toml; \
-		echo '[patch.crates-io]' >> .cargo/config.toml; \
-		echo 'axfs-ng = { path = "patches/axfs-ng" }' >> .cargo/config.toml; \
-		echo "  [patch] axfs-ng → patches/axfs-ng"; \
-	fi
 	@# If the project-specified nightly is not available (offline
 	@# evaluation environment), use RUSTFLAGS to add feature gates for
 	@# unstable APIs that the fallback nightly does not yet stabilize.
@@ -153,16 +144,15 @@ all:
 		@echo "Building LoongArch64 kernel (PCI bus, 1GB memory)..."
 		@$(MAKE) ARCH=loongarch64 BUS=pci build
 		@echo "Copying kernels for submission..."
-		@# The output filename depends on the repo name (StarryOS_*, Vegar_*, etc.)
-		@# Use glob pattern to find any matching binary
-		@_rv=$$(ls *_riscv64-qemu-virt.bin 2>/dev/null | head -1); \
+		@# Use ls -t (newest first) to always pick the just-compiled binary.
+		@_rv=$$(ls -t *_riscv64-qemu-virt.bin 2>/dev/null | head -1); \
 		if [ -n "$$_rv" ]; then \
 			cp "$$_rv" kernel-rv; \
 		else \
 			echo "ERROR: Cannot find RISC-V kernel binary"; \
 			exit 1; \
 		fi
-		@_la=$$(ls *_loongarch64-qemu-virt.bin 2>/dev/null | head -1); \
+		@_la=$$(ls -t *_loongarch64-qemu-virt.bin 2>/dev/null | head -1); \
 		if [ -n "$$_la" ]; then \
 			cp "$$_la" kernel-la; \
 		else \

@@ -24,7 +24,14 @@ pub use highlevel::*;
 pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     info!("Initialize filesystem subsystem...");
 
-    let dev = block_devs.take_one().expect("No block device found!");
+    // Pop all devices and keep the first-enumerated one (x0 = test disk).
+    // take_one() uses SmallVec::pop() (LIFO), which would return x1 (data disk)
+    // in dual-disk evaluation environments.
+    let mut all_devs = alloc::vec::Vec::new();
+    while let Some(d) = block_devs.take_one() {
+        all_devs.push(d);
+    }
+    let dev = all_devs.pop().expect("No block device found!");
     info!("  use block device 0: {:?}", dev.device_name());
 
     let fs = fs::new_default(dev).expect("Failed to initialize filesystem");
