@@ -21,11 +21,22 @@ mod highlevel;
 pub use highlevel::*;
 
 /// Initializes the filesystem subsystem using the first available block device.
+///
+/// In evaluation QEMU, two block devices are present: x0 (test disk) and
+/// x1 (auxiliary data disk). `take_one()` pops from the back (LIFO) and
+/// would give x1. We collect all devices into a temporary Vec instead,
+/// then pop from its back to get the first-enumerated device (x0 = test disk).
 pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     info!("Initialize filesystem subsystem...");
+    info!("  found {} block device(s)", block_devs.len());
 
-    let dev = block_devs.take_one().expect("No block device found!");
-    info!("  use block device 0: {:?}", dev.device_name());
+    let mut all_devs = alloc::vec::Vec::new();
+    while let Some(d) = block_devs.take_one() {
+        info!("  found {:?}", d.device_name());
+        all_devs.push(d);
+    }
+    let dev = all_devs.pop().expect("No block device found!");
+    info!("  using as root: {:?}", dev.device_name());
 
     let fs = fs::new_default(dev).expect("Failed to initialize filesystem");
     info!("  filesystem type: {:?}", fs.name());

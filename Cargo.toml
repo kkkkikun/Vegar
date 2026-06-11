@@ -92,3 +92,11 @@ optional = true
 [package.metadata.vendor-filter]
 platforms = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none-softfloat"]
 all-features = true
+
+# Patch: fix axfs-ng block device selection for dual-disk evaluation environments.
+# The upstream AxDeviceContainer::take_one() uses SmallVec::pop() (LIFO), which
+# picks the last-enumerated device (x1 = data disk) instead of the first (x0 =
+# test disk). Our patch collects all devices first, then takes the first one.
+# See patches/axfs-ng/src/lib.rs for the change.
+[patch.crates-io]
+axfs-ng = { path = "patches/axfs-ng" }
