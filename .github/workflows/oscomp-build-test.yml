@@ -140,7 +140,7 @@ jobs:
 
       - name: QEMU 启动测试
         run: |
-          echo "=== RISC-V QEMU 启动测试 ==="
+          echo "=== RISC-V QEMU 启动测试（双磁盘模拟评测） ==="
           echo "启动内核并等待 60 秒..."
           timeout 60 \
             qemu-system-riscv64 \
@@ -156,6 +156,8 @@ jobs:
             -device virtio-net-device,netdev=net \
             -netdev user,id=net \
             -rtc base=utc \
+            -drive file=disk-rv.img,if=none,format=raw,id=x1 \
+            -device virtio-blk-device,drive=x1,bus=virtio-mmio-bus.1 \
             2>&1 | tee qemu-rv.log || true
 
           echo ""
@@ -163,27 +165,28 @@ jobs:
           log_size=$(wc -c < qemu-rv.log 2>/dev/null || echo 0)
           echo "QEMU 输出大小: $log_size 字节"
 
-          if [ "$log_size" -gt 100 ]; then
-            echo "✅ RISC-V 内核产生输出，启动测试通过"
+          # 检查是否回归了双磁盘挂载崩溃
+          if grep -q "OperationNotSupported" qemu-rv.log 2>/dev/null; then
+            echo "❌ 双磁盘挂载失败（OperationNotSupported），块设备选择 BUG 回归！"
+            grep "OperationNotSupported" qemu-rv.log
+            exit 1
+          fi
+
+          # 检查测试是否真正运行
+          if grep -q "OS COMP TEST GROUP\|setup done" qemu-rv.log 2>/dev/null; then
+            echo "✅ 测试正常运行"
+            grep -c "OS COMP TEST GROUP" qemu-rv.log 2>/dev/null || true
+          elif grep -q "Failed to resolve executable" qemu-rv.log 2>/dev/null; then
+            echo "ℹ️  文件系统挂载成功，但 CI 测试磁盘缺少 /musl/busybox（非代码问题）"
+            echo "   官方评测磁盘包含正确的 busybox 路径，CI 使用 Alpine 磁盘仅验证启动"
           else
-            echo "⚠️  内核输出较少（可能未正确启动或串口未配置）"
+            echo "❌ 内核异常退出"
+            echo "--- 最后 20 行 QEMU 输出 ---"
+            tail -20 qemu-rv.log
+            exit 1
           fi
 
-          # 检查关键输出特征
-          if grep -qE "Starry|ArceOS|OSComp|OS START|test|Test|boot" qemu-rv.log 2>/dev/null; then
-            echo "✅ 检测到内核启动/运行特征"
-          fi
-
-          # 检查测试组标记（如果内核运行了测试）
-          if grep -q "OS COMP TEST GROUP" qemu-rv.log 2>/dev/null; then
-            echo "✅ 检测到测试组输出"
-            grep "OS COMP TEST GROUP" qemu-rv.log
-          fi
-
-          # 检查 QEMU 是否正常退出（内核关机）
-          if grep -q "reboot\|shutdown\|Power off\|halted\|exit" qemu-rv.log 2>/dev/null; then
-            echo "✅ 内核正常关机"
-          fi
+          echo "✅ RISC-V 启动测试通过"
 
       - name: 上传 QEMU 日志
         if: always()
@@ -222,7 +225,7 @@ jobs:
 
       - name: QEMU 启动测试
         run: |
-          echo "=== LoongArch QEMU 启动测试 ==="
+          echo "=== LoongArch QEMU 启动测试（双磁盘模拟评测） ==="
           echo "启动内核并等待 60 秒..."
           timeout 60 \
             qemu-system-loongarch64 \
@@ -237,6 +240,8 @@ jobs:
             -device virtio-net-pci,netdev=net0 \
             -netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555 \
             -rtc base=utc \
+            -drive file=disk-la.img,if=none,format=raw,id=x1 \
+            -device virtio-blk-pci,drive=x1 \
             2>&1 | tee qemu-la.log || true
 
           echo ""
@@ -244,20 +249,26 @@ jobs:
           log_size=$(wc -c < qemu-la.log 2>/dev/null || echo 0)
           echo "QEMU 输出大小: $log_size 字节"
 
-          if [ "$log_size" -gt 100 ]; then
-            echo "✅ LoongArch 内核产生输出，启动测试通过"
+          if grep -q "OperationNotSupported" qemu-la.log 2>/dev/null; then
+            echo "❌ 双磁盘挂载失败（OperationNotSupported），块设备选择 BUG 回归！"
+            grep "OperationNotSupported" qemu-la.log
+            exit 1
+          fi
+
+          if grep -q "OS COMP TEST GROUP\|setup done" qemu-la.log 2>/dev/null; then
+            echo "✅ 测试正常运行"
+            grep -c "OS COMP TEST GROUP" qemu-la.log 2>/dev/null || true
+          elif grep -q "Failed to resolve executable" qemu-la.log 2>/dev/null; then
+            echo "ℹ️  文件系统挂载成功，但 CI 测试磁盘缺少 /musl/busybox（非代码问题）"
+            echo "   官方评测磁盘包含正确的 busybox 路径，CI 使用 Alpine 磁盘仅验证启动"
           else
-            echo "⚠️  内核输出较少（可能未正确启动或串口未配置）"
+            echo "❌ 内核异常退出"
+            echo "--- 最后 20 行 QEMU 输出 ---"
+            tail -20 qemu-la.log
+            exit 1
           fi
 
-          if grep -qE "Starry|ArceOS|OSComp|OS START|test|Test|boot" qemu-la.log 2>/dev/null; then
-            echo "✅ 检测到内核启动/运行特征"
-          fi
-
-          if grep -q "OS COMP TEST GROUP" qemu-la.log 2>/dev/null; then
-            echo "✅ 检测到测试组输出"
-            grep "OS COMP TEST GROUP" qemu-la.log
-          fi
+          echo "✅ LoongArch 启动测试通过"
 
       - name: 上传 QEMU 日志
         if: always()
