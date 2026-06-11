@@ -55,6 +55,39 @@ echo "daemon:x:2:" >> /etc/group 2>/dev/null
 echo @@@@@@@@@@ setup done @@@@@@@@@@
 
 # =========================================================================
+# Time control configuration
+# All values are in seconds. Override via environment variables before
+# calling make, e.g.: make A=xxx OSCOMP_PER_CASE_TIMEOUT=60
+# =========================================================================
+
+# Maximum time for a single LTP test case (default: 30s)
+: "${OSCOMP_PER_CASE_TIMEOUT:=30}"
+
+# Maximum total time for all LTP cases within one runtime (default: 900s = 15min)
+: "${OSCOMP_LTP_TOTAL_TIMEOUT:=900}"
+
+# Maximum time for the entire test run across both runtimes (default: 3600s = 60min)
+: "${OSCOMP_TEST_TOTAL_BUDGET:=3600}"
+
+# Cleanup daemonized/background processes that tests may leave behind.
+# Failing to kill these can cause port conflicts and prevent QEMU from exiting.
+cleanup_background() {
+    for target in hackbench iperf3 netserver; do
+        for stat_file in /proc/[0-9]*/stat; do
+            [ -r "$stat_file" ] || continue
+            IFS= read -r line < "$stat_file" || continue
+            case "$line" in
+                *"($target)"*)
+                    pid=${stat_file#/proc/}
+                    pid=${pid%%/*}
+                    kill -9 "$pid" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    done
+}
+
+# =========================================================================
 # Helper: run one test with timeout and ensure END marker
 # =========================================================================
 run_test() {
@@ -84,6 +117,7 @@ run_test() {
     fi
 
     /musl/busybox killall -9 iperf3 netserver hackbench lmbench_all 2>/dev/null
+    cleanup_background
 }
 
 # =========================================================================
@@ -96,6 +130,26 @@ run_ltp() {
     runtime="$1"
     echo "#### OS COMP TEST GROUP START ltp-$runtime ####"
     cd "/$runtime/ltp/testcases/bin" 2>/dev/null || return
+
+    # Allow overriding cases via LTP_CASES env var (set before make).
+    # When set, only the specified cases are run (with per-case timeout).
+    if [ -n "$LTP_CASES" ]; then
+        echo "#### USING CUSTOM LTP CASES: $LTP_CASES ####"
+        for case in $LTP_CASES; do
+            if [ -f "$case" ]; then
+                echo "RUN LTP CASE $case"
+                /musl/busybox timeout $OSCOMP_PER_CASE_TIMEOUT ./$case
+                ret=$?
+                if [ $ret -eq 143 ]; then
+                    echo "TIMEOUT LTP CASE $case"
+                fi
+                echo "FAIL LTP CASE $case : $ret"
+            fi
+        done
+        cd /
+        echo "#### OS COMP TEST GROUP END ltp-$runtime ####"
+        return
+    fi
 
     # Curated list: basic syscall tests that are unlikely to hang
     for case in \
@@ -232,7 +286,7 @@ run_ltp() {
         procpcilocator; do
         if [ -f "$case" ]; then
             echo "RUN LTP CASE $case"
-            ./$case
+            /musl/busybox timeout $OSCOMP_PER_CASE_TIMEOUT ./$case
             ret=$?
             echo "FAIL LTP CASE $case : $ret"
         fi
@@ -253,6 +307,7 @@ for runtime in musl glibc; do
         export LD_LIBRARY_PATH=/glibc/lib
     fi
 
+    cleanup_background
     run_test "$runtime" basic       60
     run_test "$runtime" busybox     60
     run_test "$runtime" lua         60
@@ -262,8 +317,10 @@ for runtime in musl glibc; do
     run_test "$runtime" unixbench   120
     run_test "$runtime" iozone      120
     run_test "$runtime" lmbench     60
+    cleanup_background
     run_test "$runtime" iperf       120
     run_test "$runtime" netperf     120
+    cleanup_background
     run_ltp "$runtime"
 
     if [ "$runtime" = "glibc" ]; then
