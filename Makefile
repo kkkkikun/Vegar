@@ -100,17 +100,14 @@ prepare-hidden:
 			rm -f .cargo/config.toml; \
 		fi \
 	fi
-	@# Patch vendor/axfs-ng: fix block device selection for dual-disk environments.
-	@# The fix in patches/axfs-ng/ overrides take_one() behavior. For offline
-	@# (vendored) builds, [patch.crates-io] in Cargo.toml may not apply due to
-	@# source replacement. We apply the same fix to the vendor copy at build time.
-	@if [ -f patches/axfs-ng/src/lib.rs ] && [ -f vendor/axfs-ng/src/lib.rs ]; then \
-		if ! grep -q "all_devs" vendor/axfs-ng/src/lib.rs 2>/dev/null; then \
-			echo "Patching vendor/axfs-ng for dual-disk block device selection..."; \
-			cp patches/axfs-ng/src/lib.rs vendor/axfs-ng/src/lib.rs; \
-			patch_hash=$$(sha256sum vendor/axfs-ng/src/lib.rs | cut -d" " -f1); \
-			sed -i "s|\"src/lib.rs\":\"[^\"]*\"|\"src/lib.rs\":\"$$patch_hash\"|" vendor/axfs-ng/.cargo-checksum.json 2>/dev/null || true; \
-		fi \
+	@# Add [patch.crates-io] to .cargo/config.toml so that even with
+	@# source replacement, the local patch takes precedence.
+	@if [ -d patches/axfs-ng ]; then \
+		echo '' >> .cargo/config.toml; \
+		echo '# Override axfs-ng with local patch (dual-disk block device fix).' >> .cargo/config.toml; \
+		echo '[patch.crates-io]' >> .cargo/config.toml; \
+		echo 'axfs-ng = { path = "patches/axfs-ng" }' >> .cargo/config.toml; \
+		echo "  [patch] axfs-ng → patches/axfs-ng"; \
 	fi
 	@# If the project-specified nightly is not available (offline
 	@# evaluation environment), use RUSTFLAGS to add feature gates for
