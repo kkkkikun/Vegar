@@ -38,6 +38,66 @@ assertion `left != right` failed: Task(15380, "mincore01") tried to acquire mute
 
 **影响范围**：LTP mincore01 测试用例
 
+### 2. LTP msync04 测试在 LoongArch QEMU 上因磁盘空间不足而失败
+
+**状态**：⚠️ 未通过（环境配置问题）
+
+**现象**：
+```
+tst_device.c:135: TINFO: Found free device '/dev/loop0'
+tst_test.c:1106: TINFO: Formatting /dev/loop0 with ext2 opts='' extra opts=''
+mkfs.ext2: image is too small
+tst_test.c:1106: TBROK: mkfs.ext2 failed with exit code 1
+
+Summary:
+passed   0
+failed   0
+broken   1
+skipped  0
+```
+
+**原因**：
+- LTP 测试框架要求块设备最小容量为 **300MB**（为了兼容 XFS 文件系统）
+- 当前磁盘镜像 `/workspace/sdcard-la.img` 容量远小于 300MB
+- LTP 在 `/dev/loop0` 上尝试创建 ext2 文件系统时，`mkfs.ext2` 因设备空间不足而失败
+- LoongArch QEMU 仅支持 `virtio-blk-pci` 总线，不支持 `virtio-mmio`（与 RISC-V 不同）
+- 测试失败后 QEMU 未正确退出，导致脚本超时（1806秒后被迫杀死进程）
+
+**位置**：LTP 测试套件 `msync04` 用例 / QEMU LoongArch 虚拟机环境
+
+**解决方案**：
+- **临时措施**：创建第二个更大的磁盘镜像（512MB），专门供 LTP 测试使用
+- 在 QEMU 启动命令中添加第二个 `virtio-blk-pci` 设备
+- 进入系统后格式化新磁盘并挂载
+- 设置 `LTP_DEV` / `LTP_TMPDIR` 环境变量，让 LTP 使用新的大容量磁盘
+
+**具体操作步骤**：
+```bash
+# 1. 创建 512MB 磁盘镜像
+dd if=/dev/zero of=/workspace/ltp-data.img bs=1M count=512
+
+# 2. 启动 QEMU 挂载双磁盘
+qemu-system-loongarch64 -kernel /workspace/kernel-la -m 1G -nographic -smp 1 \
+    -drive file=/workspace/sdcard-la.img,if=none,format=raw,id=x0 \
+    -device virtio-blk-pci,drive=x0 \
+    -drive file=/workspace/ltp-data.img,if=none,format=raw,id=x1 \
+    -device virtio-blk-pci,drive=x1 \
+    -no-reboot -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0 -rtc base=utc
+
+# 3. 虚拟机内格式化并挂载
+mkfs.ext4 /dev/vdb
+mkdir -p /mnt/ltp
+mount /dev/vdb /mnt/ltp
+
+# 4. 设置环境变量并运行测试
+export LTP_DEV=/dev/vdb
+export LTP_TMPDIR=/mnt/ltp
+./runltp -f fs
+```
+
+**影响范围**：LoongArch QEMU 环境中所有需要大于 300MB 存储空间的 LTP 文件系统测试用例（ext2/ext3/ext4/xfs 等）
+
 ---
 
 ## 已解决问题

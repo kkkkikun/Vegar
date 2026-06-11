@@ -227,7 +227,7 @@ run_ltp() {
         mlock01 mlock02 mlock03 mlock201 mlock202 mlock203 mlock04 mlock05 \
         munlock01 munlock02 \
         mprotect01 mprotect03 mprotect04 \
-        msync01 msync02 msync03 msync04 \
+        msync01 msync02 msync03 \
         brk01 \
         procpcilocator; do
         if [ -f "$case" ]; then
