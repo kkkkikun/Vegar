@@ -135,10 +135,10 @@ build: prepare-hidden
 # === OSComp submission entry: build both arch kernels ===
 # Uses bin format since QEMU -kernel loads raw binaries at correct address.
 # The test image (provided by competition) is the first block device and gets
-# mounted as root by axfs-ng. disk.img / disk-la.img are optional auxiliary
+# mounted as root by axfs-ng. disk-rv.img / disk-la.img are optional auxiliary
 # data disks (512MB) for LTP tests that need large block devices (>=300MB).
 all:
-		@echo "=== Building OSComp 2026 Submission ==="
+	@echo "=== Building OSComp 2026 Submission ==="
 		@echo "Building RISC-V kernel (MMIO bus, 1GB memory)..."
 		@$(MAKE) ARCH=riscv64 BUS=mmio build
 		@echo "Building LoongArch64 kernel (PCI bus, 1GB memory)..."
@@ -161,11 +161,11 @@ all:
 			exit 1; \
 		fi
 		@echo "Creating auxiliary data disks (512MB each) for LTP tests..."
-		@if [ ! -f disk.img ]; then \
-			dd if=/dev/zero of=disk.img bs=1M count=512 2>/dev/null; \
-			echo "  disk.img created (512MB)"; \
+		@if [ ! -f disk-rv.img ]; then \
+			dd if=/dev/zero of=disk-rv.img bs=1M count=512 2>/dev/null; \
+			echo "  disk-rv.img created (512MB)"; \
 		else \
-			echo "  disk.img already exists"; \
+			echo "  disk-rv.img already exists"; \
 		fi
 		@if [ ! -f disk-la.img ]; then \
 			dd if=/dev/zero of=disk-la.img bs=1M count=512 2>/dev/null; \
@@ -176,7 +176,7 @@ all:
 		@echo "✓ Build complete:"
 		@echo "  kernel-rv ($(shell wc -c < kernel-rv 2>/dev/null) bytes)"
 		@echo "  kernel-la ($(shell wc -c < kernel-la 2>/dev/null) bytes)"
-		@echo "  disk.img ($(shell wc -c < disk.img 2>/dev/null) bytes)"
+		@echo "  disk-rv.img ($(shell wc -c < disk-rv.img 2>/dev/null) bytes)"
 		@echo "  disk-la.img ($(shell wc -c < disk-la.img 2>/dev/null) bytes)"
 
 ROOTFS_URL = https://github.com/Starry-OS/rootfs/releases/download/20260214

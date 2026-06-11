@@ -64,7 +64,7 @@ jobs:
           path: |
             kernel-rv
             kernel-la
-            disk.img
+            disk-rv.img
             disk-la.img
           retention-days: 7
 
