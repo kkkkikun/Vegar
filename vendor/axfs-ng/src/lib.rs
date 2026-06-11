@@ -24,7 +24,15 @@ pub use highlevel::*;
 pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     info!("Initialize filesystem subsystem...");
 
-    let dev = block_devs.take_one().expect("No block device found!");
+    // take_one() pops from the back (last enumerated), but the first
+    // enumerated device (x0 = test disk) should be used as root.
+    // In evaluation QEMU: x0=sdcard (EXT4), x1=auxiliary data disk.
+    // Pop all and keep the last one popped (which is x0, the first in enumeration order).
+    let mut dev = None;
+    while let Some(d) = block_devs.take_one() {
+        dev = Some(d);
+    }
+    let dev = dev.expect("No block device found!");
     info!("  use block device 0: {:?}", dev.device_name());
 
     let fs = fs::new_default(dev).expect("Failed to initialize filesystem");
