@@ -23,17 +23,22 @@ pub use highlevel::*;
 /// Initializes the filesystem subsystem using the first available block device.
 pub fn init_filesystems(mut block_devs: AxDeviceContainer<AxBlockDevice>) {
     info!("Initialize filesystem subsystem...");
+    info!("  found {} block device(s)", block_devs.len());
 
-    // take_one() pops from the back (last enumerated), but the first
-    // enumerated device (x0 = test disk) should be used as root.
-    // In evaluation QEMU: x0=sdcard (EXT4), x1=auxiliary data disk.
-    // Pop all and keep the last one popped (which is x0, the first in enumeration order).
-    let mut dev = None;
+    // In evaluation QEMU, x0 (test disk, EXT4) is enumerated before
+    // x1 (data disk). take_one() pops from the back (LIFO), which
+    // would give x1. Pop all into a temporary vec so we can take
+    // from the front (FIFO = first enumerated = test disk).
+    // We use Vec because it's simpler than relying on SmallVec Deref chains.
+    let mut all_devs = alloc::vec::Vec::new();
     while let Some(d) = block_devs.take_one() {
-        dev = Some(d);
+        info!("  popped device: {:?}", d.device_name());
+        all_devs.push(d);
     }
-    let dev = dev.expect("No block device found!");
-    info!("  use block device 0: {:?}", dev.device_name());
+    // all_devs = [x1, x0] (last poppped first in vec)
+    // Pop from all_devs gives x0 (first enumerated, last popped from container)
+    let dev = all_devs.pop().expect("No block device found!");
+    info!("  using as root: {:?}", dev.device_name());
 
     let fs = fs::new_default(dev).expect("Failed to initialize filesystem");
     info!("  filesystem type: {:?}", fs.name());
