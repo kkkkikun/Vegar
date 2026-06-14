@@ -172,6 +172,20 @@ pub fn sys_mmap(
             .ok_or(AxError::NoMemory)?
     };
 
+    // io_uring ring mmap: the fd is an IoRing; the offset selects one of the
+    // three SharedPages regions (SQ ring / CQ ring / SQE array). We map the
+    // exact physical pages the kernel already holds, so user and kernel share
+    // the ring with zero copy.
+    if fd > 0 {
+        if let Ok(ring) = crate::file::IoRing::from_fd(fd) {
+            let pages = ring.shared_pages_for_offset(offset)?;
+            let backend = Backend::new_shared(start, pages);
+            let populate = map_flags.contains(MmapFlags::POPULATE);
+            aspace.map(start, length, permission_flags.into(), populate, backend)?;
+            return Ok(start.as_usize() as _);
+        }
+    }
+
     let file = if fd > 0 {
         Some(File::from_fd(fd)?)
     } else {

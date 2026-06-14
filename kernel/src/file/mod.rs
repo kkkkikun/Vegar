@@ -1,6 +1,7 @@
 pub mod epoll;
 pub mod event;
 mod fs;
+pub mod io_uring;
 mod net;
 mod pidfd;
 mod pipe;
@@ -22,6 +23,7 @@ use spin::RwLock;
 
 pub use self::{
     fs::{Directory, File, resolve_at, with_fs},
+    io_uring::IoRing,
     net::Socket,
     pidfd::PidFd,
     pipe::Pipe,

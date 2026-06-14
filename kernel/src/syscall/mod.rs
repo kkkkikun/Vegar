@@ -620,12 +620,30 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         | Sysno::inotify_init1
         | Sysno::userfaultfd
         | Sysno::perf_event_open
-        | Sysno::io_uring_setup
         | Sysno::bpf
         | Sysno::fsopen
         | Sysno::fspick
         | Sysno::open_tree
         | Sysno::memfd_secret => sys_dummy_fd(sysno),
+
+        Sysno::io_uring_setup => crate::file::io_uring::syscall::sys_io_uring_setup(
+            uctx.arg0() as _,
+            uctx.arg1().into(),
+        ),
+        Sysno::io_uring_enter => crate::file::io_uring::syscall::sys_io_uring_enter(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+            uctx.arg4() as _,
+            uctx.arg5() as _,
+        ),
+        Sysno::io_uring_register => crate::file::io_uring::syscall::sys_io_uring_register(
+            uctx.arg0() as _,
+            uctx.arg1() as _,
+            uctx.arg2() as _,
+            uctx.arg3() as _,
+        ),
 
         Sysno::timer_create | Sysno::timer_gettime | Sysno::timer_settime => Ok(0),
 

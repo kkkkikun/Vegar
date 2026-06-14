@@ -6,7 +6,7 @@
 # =========================================================================
 # EDIT THIS: Choose test groups to run
 # =========================================================================
-TEST_GROUPS="lmbench"
+TEST_GROUPS=""
 
 # =========================================================================
 # Setup (same as init_oscomp.sh)
@@ -61,6 +61,29 @@ echo "users:x:100:" >> /etc/group 2>/dev/null
 echo "daemon:x:2:" >> /etc/group 2>/dev/null
 
 echo @@@@@@@@@@ setup done @@@@@@@@@@
+
+# =========================================================================
+# io_uring tests (Phase 2). Add more binaries here as M1/M2 land.
+# =========================================================================
+run_iouring() {
+    name="$1"
+    if [ -f "/$name" ]; then
+        /musl/busybox cp "/$name" "/tmp/t"
+        /musl/busybox chmod +x /tmp/t
+        echo "===== [io_uring] running $name ====="
+        /tmp/t
+        echo "===== [io_uring] $name exit=$? ====="
+    else
+        echo "===== [io_uring] /$name NOT FOUND on disk ====="
+    fi
+}
+run_iouring io_uring_nop
+run_iouring io_uring_pipe
+run_iouring io_uring_poll
+run_iouring io_uring_file
+run_iouring io_uring_bench
+run_iouring io_uring_batch
+run_iouring io_uring_scale
 
 # =========================================================================
 # Helper: run one test with timeout

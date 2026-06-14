@@ -79,6 +79,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = [
     "system",
     "ioctl",
     "loop_device",
+    "io_uring",
 ] }
 lock_api = { version = "0.4", features = ["arc_lock"] }
 memory_addr = "0.4"
