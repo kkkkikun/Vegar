@@ -84,6 +84,12 @@ run_iouring io_uring_file
 run_iouring io_uring_bench
 run_iouring io_uring_batch
 run_iouring io_uring_scale
+run_iouring io_uring_getevents
+run_iouring io_uring_readv
+run_iouring io_uring_shim_test
+run_iouring io_uring_send_recv
+run_iouring io_uring_accept
+run_iouring io_uring_iodepth
 
 # =========================================================================
 # Helper: run one test with timeout

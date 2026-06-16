@@ -24,6 +24,7 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axhal::mem::phys_to_virt;
 use axio::{IoBuf, IoBufMut, Read, Write};
+use axnet::SocketOps;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use axtask::{WaitQueue, current, future::block_on, spawn_with_name, yield_now};
@@ -31,7 +32,7 @@ use lazy_static::lazy_static;
 use linux_raw_sys::io_uring as iouring;
 use memory_addr::{PhysAddr, VirtAddr};
 
-use crate::{file::get_file_like, mm::SharedPages, task::AsThread};
+use crate::{file::{get_file_like, net::Socket}, mm::SharedPages, task::AsThread};
 
 use super::FileLike;
 
@@ -59,11 +60,19 @@ const CQ_OFF_CQES: usize = 0x18;
 
 /// IORING_OP_* values we support.
 const OP_NOP: u8 = iouring::io_uring_op::IORING_OP_NOP as u8;
+const OP_READV: u8 = iouring::io_uring_op::IORING_OP_READV as u8;
+const OP_WRITEV: u8 = iouring::io_uring_op::IORING_OP_WRITEV as u8;
 const OP_READ: u8 = iouring::io_uring_op::IORING_OP_READ as u8;
 const OP_WRITE: u8 = iouring::io_uring_op::IORING_OP_WRITE as u8;
 const OP_READ_FIXED: u8 = iouring::io_uring_op::IORING_OP_READ_FIXED as u8;
 const OP_WRITE_FIXED: u8 = iouring::io_uring_op::IORING_OP_WRITE_FIXED as u8;
 const OP_POLL_ADD: u8 = iouring::io_uring_op::IORING_OP_POLL_ADD as u8;
+const OP_SEND: u8 = iouring::io_uring_op::IORING_OP_SEND as u8;
+const OP_RECV: u8 = iouring::io_uring_op::IORING_OP_RECV as u8;
+const OP_ACCEPT: u8 = iouring::io_uring_op::IORING_OP_ACCEPT as u8;
+
+/// `MSG_DONTWAIT` — recv/send without blocking (skip the readiness wait).
+const MSG_DONTWAIT: u32 = 0x40;
 
 /// A user buffer resolved to its physical pages while the submitter's address
 /// space was active (at `enter` time). The worker accesses the bytes through
@@ -197,14 +206,22 @@ struct Op {
     /// Resolved in the submitter's context (worker cannot resolve fds itself:
     /// FD_TABLE is scope-local and the worker has no Thread extension).
     file: Option<Arc<dyn FileLike>>,
-    /// Resolved user buffer (READ/WRITE). `None` for NOP.
-    buf: Option<PinnedUserBuf>,
+    /// Resolved user buffer(s). A `Vec` so READV/WRITEV can carry multiple
+    /// iovecs; single-buffer ops (READ/WRITE/FIXED) wrap one entry. `None` for
+    /// NOP / ACCEPT.
+    buf: Option<Vec<PinnedUserBuf>>,
     /// Requested poll events for POLL_ADD (0 otherwise).
     poll_events: u32,
+    /// `msg_flags` for SEND/RECV (e.g. MSG_DONTWAIT). 0 otherwise.
+    msg_flags: u32,
     /// This op's CQ ring view + the pages that back it (keepalive: the pages
     /// stay pinned until the CQE is posted, even if the fd is already closed).
     cq: CqRing,
     cq_pages: Arc<SharedPages>,
+    /// Per-ring completion wait queue + overflow list, so the worker can post a
+    /// CQE (or buffer it) and wake any submitter parked in GETEVENTS.
+    cq_wq: Arc<WaitQueue>,
+    overflow: Arc<Mutex<VecDeque<(u64, i32)>>>,
 }
 
 /// Race-free blocking queue: submitter pushes, worker pops.
@@ -256,7 +273,8 @@ struct SqRing {
 struct CqRing {
     head: *const AtomicU32,
     tail: *const AtomicU32,
-    cqes: *mut iouring::io_uring_cqe, // at CQ_OFF_CQES in the CQ ring page
+    cqes: *mut iouring::io_uring_cqe,    // at CQ_OFF_CQES in the CQ ring page
+    overflow_ctr: *mut AtomicU32,        // user-visible overflow counter (CQ_OFF_OVERFLOW)
     mask: u32,
     entries: u32,
 }
@@ -277,6 +295,13 @@ pub struct IoRing {
     sq: SqRing,
     cq: CqRing,
     registered_bufs: Mutex<Vec<Option<PinnedUserBuf>>>,
+    /// Waiters blocked in `io_uring_enter(GETEVENTS)` are parked here; the
+    /// worker wakes them from `post_cqe` once CQEs appear.
+    cq_wq: Arc<WaitQueue>,
+    /// CQEs that didn't fit the ring (the user isn't reaping fast enough) are
+    /// buffered here and replayed oldest-first as ring slots free. Prevents the
+    /// silent overwrite the old `post_cqe` performed when the ring was full.
+    overflow: Arc<Mutex<VecDeque<(u64, i32)>>>,
 }
 
 fn page_ptr(pages: &SharedPages, idx: usize) -> *mut u8 {
@@ -344,6 +369,7 @@ impl IoRing {
             head: unsafe { cq_base.add(CQ_OFF_HEAD) as *const AtomicU32 },
             tail: unsafe { cq_base.add(CQ_OFF_TAIL) as *const AtomicU32 },
             cqes: unsafe { cq_base.add(CQ_OFF_CQES) as *mut iouring::io_uring_cqe },
+            overflow_ctr: unsafe { cq_base.add(CQ_OFF_OVERFLOW) as *mut AtomicU32 },
             mask: entries - 1,
             entries,
         };
@@ -359,6 +385,8 @@ impl IoRing {
             sq,
             cq,
             registered_bufs: Mutex::new(Vec::new()),
+            cq_wq: Arc::new(WaitQueue::new()),
+            overflow: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -416,6 +444,27 @@ impl IoRing {
 }
 
 impl IoRing {
+    /// Block (in the submitter's task context) until at least `min_complete`
+    /// CQEs are available — counting both entries already in the ring and any
+    /// buffered in the overflow replay list. Used by `io_uring_enter(GETEVENTS)`.
+    ///
+    /// The worker wakes `cq_wq` from `post_cqe`; `WaitQueue::wait_until`
+    /// registers its listener before the final condition re-check, so no
+    /// completion posted between the check and the registration is lost.
+    pub(crate) fn wait_for_completions(&self, min_complete: u32) {
+        if min_complete == 0 {
+            return;
+        }
+        let head = self.cq.head;
+        let tail = self.cq.tail;
+        let overflow = &self.overflow;
+        self.cq_wq.wait_until(|| {
+            let in_ring = unsafe { (*tail).load(Ordering::Acquire) }
+                .wrapping_sub(unsafe { (*head).load(Ordering::Acquire) });
+            in_ring + overflow.lock().len() as u32 >= min_complete
+        });
+    }
+
     /// Read pending SQEs from the shared SQ ring and enqueue them as ops for
     /// the worker. Advances the SQ head with Release so the user sees the slots
     /// consumed. Shared by `io_uring_enter` and the boot-time self-test.
@@ -425,26 +474,75 @@ impl IoRing {
     /// (`PinnedUserBuf::resolve`, which walks the live page table) happen here —
     /// the worker only ever touches the already-resolved `Arc<dyn FileLike>` and
     /// phys pages.
-    pub(crate) fn submit_pending(&self) -> usize {
+    pub(crate) fn submit_pending(&self) -> (usize, Vec<(u64, Arc<Socket>)>) {
         let sq = &self.sq;
         let mask = sq.mask as usize;
         let tail = unsafe { (*sq.tail).load(Ordering::Acquire) };
         let head = unsafe { (*sq.head).load(Ordering::Relaxed) };
         let n = (tail.wrapping_sub(head) as usize).min(sq.entries as usize);
+        // ACCEPT is handled in the submitter's context (it must install the new
+        // fd via the scope-local FD_TABLE, which the worker cannot reach), so we
+        // collect ACCEPT requests here and hand them back to io_uring_enter
+        // rather than enqueuing them for the worker. Non-ACCEPT ops below go to
+        // the worker as usual.
+        let mut accepts: Vec<(u64, Arc<Socket>)> = Vec::new();
         for i in 0..n {
             let slot = (head.wrapping_add(i as u32) as usize) & mask;
             let sqe_idx = unsafe { (*sq.array.add(slot)).load(Ordering::Acquire) } as usize & mask;
             let sqe = unsafe { &*sq.sqes.add(sqe_idx) };
 
-            // Resolve fd + user buffer / poll mask in this (submitter) context.
+            if sqe.opcode == OP_ACCEPT {
+                if let Ok(listener) = Socket::from_fd(sqe.fd) {
+                    accepts.push((sqe.user_data, listener));
+                }
+                continue;
+            }
+
+            // Resolve fd + user buffer(s) / poll mask in this (submitter) context.
             // For FIXED variants, clone a pre-registered buffer (no page walk).
             let mut poll_events = 0u32;
+            let mut msg_flags = 0u32;
             let (file, buf, use_opcode) = match sqe.opcode {
                 OP_READ | OP_WRITE => {
                     let file = get_file_like(sqe.fd).ok();
                     let addr = unsafe { sqe.__bindgen_anon_2.addr as usize };
-                    let buf = PinnedUserBuf::resolve(addr, sqe.len as usize).ok();
+                    let buf = PinnedUserBuf::resolve(addr, sqe.len as usize)
+                        .ok()
+                        .map(|b| alloc::vec![b]);
                     (file, buf, sqe.opcode)
+                }
+                OP_SEND | OP_RECV => {
+                    // Socket send/recv: same buffer layout as read/write, but the
+                    // worker drives them through a readiness wait + nonblocking I/O
+                    // (so a blocking RECV never wedges the single serial worker).
+                    msg_flags = unsafe { sqe.__bindgen_anon_3.msg_flags };
+                    let file = get_file_like(sqe.fd).ok();
+                    let addr = unsafe { sqe.__bindgen_anon_2.addr as usize };
+                    let buf = PinnedUserBuf::resolve(addr, sqe.len as usize)
+                        .ok()
+                        .map(|b| alloc::vec![b]);
+                    (file, buf, sqe.opcode)
+                }
+                OP_READV | OP_WRITEV => {
+                    let file = get_file_like(sqe.fd).ok();
+                    let iov_base = unsafe { sqe.__bindgen_anon_2.addr as usize };
+                    let nr = sqe.len as usize; // for readv/writev, len = iovec count
+                    let mut bufs = Vec::new();
+                    for i in 0..nr {
+                        #[repr(C)]
+                        struct IoVec {
+                            base: usize,
+                            len: usize,
+                        }
+                        let iov_ptr: crate::mm::UserConstPtr<IoVec> = (iov_base + i * 16).into();
+                        if let Ok(iov) = iov_ptr.get_as_ref() {
+                            if let Ok(b) = PinnedUserBuf::resolve(iov.base, iov.len) {
+                                bufs.push(b);
+                            }
+                        }
+                    }
+                    let oc = if sqe.opcode == OP_READV { OP_READ } else { OP_WRITE };
+                    (file, if bufs.is_empty() { None } else { Some(bufs) }, oc)
                 }
                 OP_READ_FIXED | OP_WRITE_FIXED => {
                     let file = get_file_like(sqe.fd).ok();
@@ -454,7 +552,8 @@ impl IoRing {
                         .lock()
                         .get(idx)
                         .and_then(Option::as_ref)
-                        .map(PinnedUserBuf::clone);
+                        .map(PinnedUserBuf::clone)
+                        .map(|b| alloc::vec![b]);
                     let oc = if sqe.opcode == OP_READ_FIXED {
                         OP_READ
                     } else {
@@ -474,12 +573,42 @@ impl IoRing {
                 file,
                 buf,
                 poll_events,
+                msg_flags,
                 cq: self.cq,
                 cq_pages: self.cq_ring_pages.clone(),
+                cq_wq: self.cq_wq.clone(),
+                overflow: self.overflow.clone(),
             });
         }
         unsafe { (*sq.head).store(head.wrapping_add(n as u32), Ordering::Release) };
-        n
+        (n, accepts)
+    }
+
+    /// Drive one ACCEPT request in the submitter's task context: park until the
+    /// listener is readable (a connection is pending), accept it, install the
+    /// new socket as an fd, and post a CQE whose `res` is that fd (or -errno).
+    pub(crate) fn complete_accept(&self, user_data: u64, listener: &Arc<Socket>) {
+        let l = listener.clone();
+        block_on(poll_fn(move |cx| {
+            if l.poll().intersects(IoEvents::IN) {
+                Poll::Ready(())
+            } else {
+                l.register(cx, IoEvents::IN);
+                Poll::Pending
+            }
+        }));
+        let res = match listener.accept() {
+            Ok(inner) => {
+                // add_to_fd_table takes ownership (like sys_accept4); it wraps the
+                // socket in an Arc internally and inserts it into the fd table.
+                Socket(inner)
+                    .add_to_fd_table(false)
+                    .map(|fd| fd as i32)
+                    .unwrap_or(-9)
+            }
+            Err(_) => -5,
+        };
+        post_cqe(&self.cq, &self.overflow, &self.cq_wq, user_data, res);
     }
 }
 
@@ -505,17 +634,45 @@ impl Pollable for IoRing {
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
 }
 
-/// Post a completion. Only the worker calls this, so `cq.tail` is single-writer.
-fn post_cqe(cq: &CqRing, user_data: u64, res: i32) {
-    let tail = unsafe { (*cq.tail).load(Ordering::Relaxed) };
-    let idx = (tail & cq.mask) as usize;
-    unsafe {
-        let cqe = cq.cqes.add(idx);
-        (*cqe).user_data = user_data;
-        (*cqe).res = res;
-        (*cqe).flags = 0;
+/// Post a completion (worker only → single writer of `cq.tail`). If the ring is
+/// full, the CQE is buffered in `overflow` and replayed oldest-first as the user
+/// reaps (advances `cq.head`), avoiding the silent overwrite the old version did
+/// when the ring was full. Genuine backup beyond one ring's depth is dropped and
+/// reported via the user-visible overflow counter. Wakes any submitter parked in
+/// `io_uring_enter(GETEVENTS)`.
+fn post_cqe(
+    cq: &CqRing,
+    overflow: &Mutex<VecDeque<(u64, i32)>>,
+    wq: &WaitQueue,
+    user_data: u64,
+    res: i32,
+) {
+    let head = unsafe { (*cq.head).load(Ordering::Acquire) };
+    let mut tail = unsafe { (*cq.tail).load(Ordering::Relaxed) };
+    let mut pend = overflow.lock();
+    pend.push_back((user_data, res));
+    // Drain as many buffered entries as fit (oldest first).
+    while tail.wrapping_sub(head) < cq.entries {
+        let Some((ud, r)) = pend.pop_front() else { break };
+        let idx = (tail & cq.mask) as usize;
+        unsafe {
+            let cqe = cq.cqes.add(idx);
+            (*cqe).user_data = ud;
+            (*cqe).res = r;
+            (*cqe).flags = 0;
+        }
+        tail = tail.wrapping_add(1);
     }
-    unsafe { (*cq.tail).store(tail.wrapping_add(1), Ordering::Release) };
+    unsafe { (*cq.tail).store(tail, Ordering::Release) };
+    // Catastrophic backup: replay buffer itself exceeded one ring's depth.
+    // Drop the oldest and bump the user-visible overflow counter.
+    if pend.len() > cq.entries as usize {
+        pend.pop_front();
+        let ov = unsafe { (*cq.overflow_ctr).load(Ordering::Relaxed) };
+        unsafe { (*cq.overflow_ctr).store(ov + 1, Ordering::Release) };
+    }
+    drop(pend);
+    wq.notify_all(false);
 }
 
 /// Global op queue + worker shared by ALL IoRing instances. Initialized on
@@ -532,6 +689,52 @@ lazy_static! {
     };
 }
 
+/// Drive a socket RECV/SEND: wait for readability/writability (unless
+/// `dontwait`), then perform a nonblocking recv/send so the single serial
+/// worker is never wedged inside a blocking socket syscall. Returns bytes
+/// transferred, or -EAGAIN (no data / DONTWAIT on empty) / -EIO.
+fn recv_or_send(
+    file: &Arc<dyn FileLike>,
+    bufs: &mut [PinnedUserBuf],
+    is_read: bool,
+    dontwait: bool,
+) -> i32 {
+    if !dontwait {
+        let events = if is_read { IoEvents::IN } else { IoEvents::OUT };
+        let f = file.clone();
+        block_on(poll_fn(move |cx| {
+            if f.poll().intersects(events) {
+                Poll::Ready(())
+            } else {
+                f.register(cx, events);
+                Poll::Pending
+            }
+        }));
+    }
+    // Run this op's I/O nonblocking, then restore the socket's prior mode.
+    let was_nonblock = file.nonblocking();
+    let _ = file.set_nonblocking(true);
+    let mut total: i32 = 0;
+    let mut err: i32 = 0;
+    for buf in bufs.iter_mut() {
+        let r = if is_read { file.read(buf) } else { file.write(buf) };
+        match r {
+            Ok(0) => break,
+            Ok(n) => total = total.wrapping_add(n as i32),
+            Err(_) => {
+                err = -11; // EAGAIN
+                break;
+            }
+        }
+    }
+    let _ = file.set_nonblocking(was_nonblock);
+    if total == 0 && err != 0 {
+        err
+    } else {
+        total
+    }
+}
+
 /// The single, permanent io_uring worker. Processes ops sequentially within
 /// this task: each op blocks via `block_on` / `poll_io` inside the fd's own
 /// `read`/`write` impl, parking the *worker* (not a separate task). This is a
@@ -544,14 +747,60 @@ fn global_worker(queue: Arc<OpQueue>) {
         let res: i32 = match op.opcode {
             OP_NOP => 0,
             OP_READ => match (op.file, op.buf) {
-                (Some(file), Some(mut buf)) => {
-                    file.read(&mut buf).map(|n| n as i32).unwrap_or(-5)
+                (Some(file), Some(mut bufs)) => {
+                    // READV/READ: drive each iovec segment through the file's
+                    // read (recv for sockets) in order, summing bytes.
+                    let mut total: i32 = 0;
+                    let mut err: i32 = 0;
+                    for buf in bufs.iter_mut() {
+                        match file.read(buf) {
+                            Ok(0) => break,
+                            Ok(n) => total = total.wrapping_add(n as i32),
+                            Err(_) => {
+                                err = -5;
+                                break;
+                            }
+                        }
+                    }
+                    if total == 0 && err != 0 {
+                        err
+                    } else {
+                        total
+                    }
                 }
                 _ => -9,
             },
             OP_WRITE => match (op.file, op.buf) {
-                (Some(file), Some(mut buf)) => {
-                    file.write(&mut buf).map(|n| n as i32).unwrap_or(-5)
+                (Some(file), Some(mut bufs)) => {
+                    // WRITEV/WRITE: send each iovec segment in order.
+                    let mut total: i32 = 0;
+                    let mut err: i32 = 0;
+                    for buf in bufs.iter_mut() {
+                        match file.write(buf) {
+                            Ok(0) => break,
+                            Ok(n) => total = total.wrapping_add(n as i32),
+                            Err(_) => {
+                                err = -5;
+                                break;
+                            }
+                        }
+                    }
+                    if total == 0 && err != 0 {
+                        err
+                    } else {
+                        total
+                    }
+                }
+                _ => -9,
+            },
+            // SEND/RECV: socket send/recv via a readiness wait + nonblocking I/O,
+            // so a blocking RECV on an empty socket never wedges the single
+            // serial worker. MSG_DONTWAIT skips the wait and returns -EAGAIN.
+            OP_SEND | OP_RECV => match (op.file, op.buf) {
+                (Some(file), Some(mut bufs)) => {
+                    let is_read = op.opcode == OP_RECV;
+                    let dontwait = op.msg_flags & MSG_DONTWAIT != 0;
+                    recv_or_send(&file, &mut bufs, is_read, dontwait)
                 }
                 _ => -9,
             },
@@ -575,7 +824,7 @@ fn global_worker(queue: Arc<OpQueue>) {
             _ => -38,
         };
         // op.cq_pages 保持存活直至 CQE 写入
-        post_cqe(&op.cq, op.user_data, res);
+        post_cqe(&op.cq, &op.overflow, &op.cq_wq, op.user_data, res);
     }
 }
 
@@ -604,7 +853,7 @@ pub fn selftest() {
     }
 
     // Submit (reads the SQ ring exactly like io_uring_enter does).
-    let submitted = ring.submit_pending();
+    let (submitted, _accepts) = ring.submit_pending();
 
     // Reap the CQE. SMP=1, so we must yield to let the worker run.
     let cq = &ring.cq;

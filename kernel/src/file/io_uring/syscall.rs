@@ -31,32 +31,55 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<io_uring_params>) ->
     Ok(fd as isize)
 }
 
+/// `IORING_ENTER_GETEVENTS`: block the caller until at least `min_complete`
+/// CQEs are available (ring + overflow replay buffer).
+const IORING_ENTER_GETEVENTS: u32 = 1;
+
 /// `io_uring_enter(fd, to_submit, min_complete, flags, arg, sz)` -> #submitted.
 ///
 /// Runs in the submitter's task context, so the SQ ring is read directly from
 /// the shared pages. Each consumed SQE is turned into an `Op` and handed to the
 /// worker; the SQ head is advanced with Release so the user sees the slots freed.
+///
+/// With `IORING_ENTER_GETEVENTS`, the caller blocks until `min_complete` CQEs are
+/// available — the worker posts them and wakes this task via the ring's wait
+/// queue (this is the path liburing's `io_uring_submit_and_wait` /
+/// `io_uring_wait_cqe` rely on).
 pub fn sys_io_uring_enter(
     fd: i32,
     to_submit: u32,
-    _min_complete: u32,
-    _flags: u32,
+    min_complete: u32,
+    flags: u32,
     _arg: usize,
     _sz: usize,
 ) -> AxResult<isize> {
     let ring = IoRing::from_fd(fd)?;
-    // M0: drain all available SQEs (to_submit is treated as a hint; GETEVENTS
-    // waiting is not yet implemented — the user reaps CQEs from the shared ring).
-    let n = ring.submit_pending();
+    // Drain all available SQEs (to_submit is treated as a hint). fd and user
+    // buffer resolution happen here, in the submitter's context. ACCEPT requests
+    // are returned separately (they must run in this context to install fds).
+    let (n, accepts) = ring.submit_pending();
+    // Run ACCEPTs here — after the other ops are queued for the worker, so the
+    // worker can drive RECV/SEND on existing connections while we park waiting
+    // for a new one. Each ACCEPT posts its own CQE (res = new fd).
+    for (ud, listener) in accepts {
+        ring.complete_accept(ud, &listener);
+    }
 
-    debug!("sys_io_uring_enter <= fd: {fd}, to_submit: {to_submit}, submitted: {n}");
-
-    // 🚀 核心新增：在单核（smp=1）调度下，主动让出一次 CPU 
-    // 确保刚被 submit_pending 推入全局队列的子任务线程有充足的机会被调度器切上去跑！
-    if n > 0 {
+    if flags & IORING_ENTER_GETEVENTS != 0 {
+        // Block this task until min_complete CQEs land. The worker (a separate
+        // task) posts them and wakes us; on SMP=1 parking here is what lets the
+        // worker get scheduled and run.
+        ring.wait_for_completions(min_complete);
+    } else if n > 0 {
+        // No GETEVENTS: the user reaps the shared ring themselves. On SMP=1
+        // yield once so the worker gets a turn before we return.
         axtask::yield_now();
     }
 
+    debug!(
+        "sys_io_uring_enter <= fd: {fd}, to_submit: {to_submit}, min_complete: {min_complete}, \
+         flags: {flags:#x}, submitted: {n}"
+    );
     Ok(n as isize)
 }
 
