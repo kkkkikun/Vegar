@@ -15,10 +15,10 @@ pub mod syscall;
 
 use alloc::{borrow::Cow, collections::VecDeque, format, sync::Arc, vec::Vec};
 use core::{
-    future::poll_fn,
+    future::{poll_fn, Future},
+    pin::Pin,
     sync::atomic::{AtomicU32, Ordering},
-    task::{Context, Poll},
-    time::Duration,
+    task::{Context, Poll, Waker},
 };
 
 use axerrno::{AxError, AxResult};
@@ -224,36 +224,188 @@ struct Op {
     overflow: Arc<Mutex<VecDeque<(u64, i32)>>>,
 }
 
-/// Race-free blocking queue: submitter pushes, worker pops.
+/// A pollable in-flight operation driven by the multiplexing worker. This is a
+/// hand-rolled state machine (`impl Future`, NOT `async fn`) so it is `Unpin` —
+/// the worker stores many of these in a `VecDeque` and re-polls them across
+/// iterations without `Pin<Box>`. Each field is owned, so the future registers
+/// the worker's waker (via `Pollable::register`) and completes when its
+/// resource becomes ready, letting the worker multiplex N pending ops on one
+/// task — the single-core io_uring value (event-driven concurrency, O(1)
+/// memory).
+struct OpFuture {
+    user_data: u64,
+    opcode: u8,
+    file: Option<Arc<dyn FileLike>>,
+    buf: Option<Vec<PinnedUserBuf>>,
+    poll_events: u32,
+    msg_flags: u32,
+    cq: CqRing,
+    cq_pages: Arc<SharedPages>,
+    cq_wq: Arc<WaitQueue>,
+    overflow: Arc<Mutex<VecDeque<(u64, i32)>>>,
+}
+
+impl From<Op> for OpFuture {
+    fn from(op: Op) -> Self {
+        let Op {
+            user_data,
+            opcode,
+            file,
+            buf,
+            poll_events,
+            msg_flags,
+            cq,
+            cq_pages,
+            cq_wq,
+            overflow,
+        } = op;
+        Self {
+            user_data,
+            opcode,
+            file,
+            buf,
+            poll_events,
+            msg_flags,
+            cq,
+            cq_pages,
+            cq_wq,
+            overflow,
+        }
+    }
+}
+
+impl OpFuture {
+    /// Completion metadata: what the worker needs to post the CQE once this
+    /// future is `Ready`. `cq_pages` is included so the CQ ring pages stay
+    /// pinned until `post_cqe` finishes (the IoRing fd may already be closed).
+    fn meta(
+        &self,
+    ) -> (
+        CqRing,
+        Arc<WaitQueue>,
+        Arc<Mutex<VecDeque<(u64, i32)>>>,
+        Arc<SharedPages>,
+        u64,
+    ) {
+        (
+            self.cq,
+            self.cq_wq.clone(),
+            self.overflow.clone(),
+            self.cq_pages.clone(),
+            self.user_data,
+        )
+    }
+
+    /// Readiness-wait + nonblocking read/write. Poll semantics: `Pending`
+    /// (registers the worker waker) until the fd is readable/writable; then one
+    /// nonblocking pass over the iovec segments. A spurious EAGAIN (readiness
+    /// reported but I/O still blocked — rare race) re-arms and returns
+    /// `Pending` so a blocking op is never falsely reported as -EAGAIN.
+    fn poll_rw(&mut self, cx: &mut Context<'_>, is_read: bool) -> Poll<i32> {
+        let file = match self.file.as_ref() {
+            Some(f) => f.clone(),
+            None => return Poll::Ready(-9),
+        };
+        let bufs = match self.buf.as_mut() {
+            Some(b) => b,
+            None => return Poll::Ready(-9),
+        };
+        let dontwait = self.msg_flags & MSG_DONTWAIT != 0;
+        let events = if is_read { IoEvents::IN } else { IoEvents::OUT };
+        if !dontwait && !file.poll().intersects(events) {
+            file.register(cx, events);
+            return Poll::Pending;
+        }
+        let was_nonblock = file.nonblocking();
+        if !was_nonblock {
+            let _ = file.set_nonblocking(true);
+        }
+        let mut total: i32 = 0;
+        let mut err: i32 = 0;
+        for buf in bufs.iter_mut() {
+            let r = if is_read { file.read(buf) } else { file.write(buf) };
+            match r {
+                Ok(0) => break,
+                Ok(n) => total = total.wrapping_add(n as i32),
+                Err(_) => {
+                    err = -11; // EAGAIN
+                    break;
+                }
+            }
+        }
+        if !was_nonblock {
+            let _ = file.set_nonblocking(false);
+        }
+        if total == 0 && err != 0 {
+            if dontwait {
+                Poll::Ready(err)
+            } else {
+                file.register(cx, events);
+                Poll::Pending
+            }
+        } else {
+            Poll::Ready(total)
+        }
+    }
+}
+
+impl Future for OpFuture {
+    type Output = i32;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+        match self.opcode {
+            OP_NOP => Poll::Ready(0),
+            OP_POLL_ADD => match self.file.as_ref() {
+                Some(file) => {
+                    let events = IoEvents::from_bits_truncate(self.poll_events);
+                    let cur = file.poll();
+                    if cur.intersects(events) {
+                        Poll::Ready(cur.bits() as i32)
+                    } else {
+                        file.register(cx, events);
+                        Poll::Pending
+                    }
+                }
+                None => Poll::Ready(-9),
+            },
+            OP_READ | OP_RECV => self.poll_rw(cx, true),
+            OP_WRITE | OP_SEND => self.poll_rw(cx, false),
+            _ => Poll::Ready(-38),
+        }
+    }
+}
+
+/// Race-free op queue: the submitter pushes, the multiplexing worker pops.
 struct OpQueue {
     inner: Mutex<VecDeque<Op>>,
-    wq: WaitQueue,
+    /// The worker registers its waker here before parking, so a `push` wakes it
+    /// (alongside any readiness the in-flight ops registered on their own).
+    worker_waker: Mutex<Option<Waker>>,
 }
 
 impl OpQueue {
     const fn new() -> Self {
         Self {
             inner: Mutex::new(VecDeque::new()),
-            wq: WaitQueue::new(),
+            worker_waker: Mutex::new(None),
         }
     }
 
     fn push(&self, op: Op) {
         self.inner.lock().push_back(op);
-        self.wq.notify_one(true);
+        if let Some(w) = self.worker_waker.lock().take() {
+            w.wake();
+        }
     }
 
-    fn pop(&self) -> Op {
-        // Bounded wait: wake immediately on `notify` for normal ops, and every
-        // 50ms as a fallback. The fallback matters for shutdown — the worker
-        // must notice `shutdown=true` even if the notify fired from a context
-        // (e.g. `IoRing::drop` in the gc task) that can't reschedule us.
-        loop {
-            if let Some(op) = self.inner.lock().pop_front() {
-                return op;
-            }
-            self.wq.wait_timeout(Duration::from_millis(50));
-        }
+    /// Non-blocking pop; the worker calls this each pass of its event loop.
+    fn try_pop(&self) -> Option<Op> {
+        self.inner.lock().pop_front()
+    }
+
+    /// Register the worker's waker so the next `push` wakes it. Called right
+    /// before the worker parks.
+    fn register_worker(&self, cx: &mut Context<'_>) {
+        *self.worker_waker.lock() = Some(cx.waker().clone());
     }
 }
 
@@ -689,143 +841,69 @@ lazy_static! {
     };
 }
 
-/// Drive a socket RECV/SEND: wait for readability/writability (unless
-/// `dontwait`), then perform a nonblocking recv/send so the single serial
-/// worker is never wedged inside a blocking socket syscall. Returns bytes
-/// transferred, or -EAGAIN (no data / DONTWAIT on empty) / -EIO.
-fn recv_or_send(
-    file: &Arc<dyn FileLike>,
-    bufs: &mut [PinnedUserBuf],
-    is_read: bool,
-    dontwait: bool,
-) -> i32 {
-    if !dontwait {
-        let events = if is_read { IoEvents::IN } else { IoEvents::OUT };
-        let f = file.clone();
-        block_on(poll_fn(move |cx| {
-            if f.poll().intersects(events) {
-                Poll::Ready(())
-            } else {
-                f.register(cx, events);
-                Poll::Pending
-            }
-        }));
-    }
-    // Run this op's I/O nonblocking, then restore the socket's prior mode.
-    let was_nonblock = file.nonblocking();
-    let _ = file.set_nonblocking(true);
-    let mut total: i32 = 0;
-    let mut err: i32 = 0;
-    for buf in bufs.iter_mut() {
-        let r = if is_read { file.read(buf) } else { file.write(buf) };
-        match r {
-            Ok(0) => break,
-            Ok(n) => total = total.wrapping_add(n as i32),
-            Err(_) => {
-                err = -11; // EAGAIN
-                break;
+/// The single, permanent io_uring worker — a **multiplexing event loop** on one
+/// task (single-core friendly). It holds N in-flight `OpFuture`s and polls ALL
+/// of them each pass with the worker's own waker, so any op's resource
+/// readiness re-schedules the worker; ready ops complete (post CQE), and the
+/// worker parks only when nothing is ready and the queue is empty. This is what
+/// lets a single-threaded event-driven server (e.g. tokio-rs `tcp_echo`) handle
+/// many concurrent connections without head-of-line blocking — O(1) memory,
+/// real concurrency, no per-op task stack.
+fn global_worker(queue: Arc<OpQueue>) {
+    block_on(async move {
+        let mut inflight: VecDeque<OpFuture> = VecDeque::new();
+        loop {
+            // One pass: drain newly-queued ops, poll every in-flight op once,
+            // collect completions, and park if nothing progressed.
+            let done: Vec<(
+                CqRing,
+                Arc<WaitQueue>,
+                Arc<Mutex<VecDeque<(u64, i32)>>>,
+                Arc<SharedPages>,
+                u64,
+                i32,
+            )> = poll_fn(|cx| {
+                let mut progressed = false;
+                while let Some(op) = queue.try_pop() {
+                    inflight.push_back(OpFuture::from(op));
+                    progressed = true;
+                }
+                let mut done = Vec::new();
+                for _ in 0..inflight.len() {
+                    let mut f = inflight.pop_front().unwrap();
+                    match Pin::new(&mut f).poll(cx) {
+                        Poll::Ready(res) => {
+                            let (cq, wq, ov, pages, ud) = f.meta();
+                            done.push((cq, wq, ov, pages, ud, res));
+                            progressed = true;
+                        }
+                        Poll::Pending => inflight.push_back(f),
+                    }
+                }
+                if progressed {
+                    Poll::Ready(done)
+                } else {
+                    // Park: register the worker waker for new-op arrival. The
+                    // in-flight ops already registered it on their resources, so
+                    // any readiness also wakes us. Re-check the queue after
+                    // registering to avoid a lost wakeup.
+                    queue.register_worker(cx);
+                    if queue.try_pop().is_some() {
+                        Poll::Ready(Vec::new())
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            })
+            .await;
+
+            for (cq, wq, ov, _pages, ud, res) in done {
+                // `_pages` (the OpFuture's CQ-pages keepalive) stays alive until
+                // the end of this iteration, i.e. past `post_cqe`.
+                post_cqe(&cq, &ov, &wq, ud, res);
             }
         }
-    }
-    let _ = file.set_nonblocking(was_nonblock);
-    if total == 0 && err != 0 {
-        err
-    } else {
-        total
-    }
-}
-
-/// The single, permanent io_uring worker. Processes ops sequentially within
-/// this task: each op blocks via `block_on` / `poll_io` inside the fd's own
-/// `read`/`write` impl, parking the *worker* (not a separate task). This is a
-/// simple cooperative-coroutine model — the existing axtask async runtime
-/// (`block_on` / `AxWaker` / `poll_fn`) is the coroutine executor. No per-op
-/// task allocation means near-zero scheduling overhead.
-fn global_worker(queue: Arc<OpQueue>) {
-    loop {
-        let op = queue.pop();
-        let res: i32 = match op.opcode {
-            OP_NOP => 0,
-            OP_READ => match (op.file, op.buf) {
-                (Some(file), Some(mut bufs)) => {
-                    // READV/READ: drive each iovec segment through the file's
-                    // read (recv for sockets) in order, summing bytes.
-                    let mut total: i32 = 0;
-                    let mut err: i32 = 0;
-                    for buf in bufs.iter_mut() {
-                        match file.read(buf) {
-                            Ok(0) => break,
-                            Ok(n) => total = total.wrapping_add(n as i32),
-                            Err(_) => {
-                                err = -5;
-                                break;
-                            }
-                        }
-                    }
-                    if total == 0 && err != 0 {
-                        err
-                    } else {
-                        total
-                    }
-                }
-                _ => -9,
-            },
-            OP_WRITE => match (op.file, op.buf) {
-                (Some(file), Some(mut bufs)) => {
-                    // WRITEV/WRITE: send each iovec segment in order.
-                    let mut total: i32 = 0;
-                    let mut err: i32 = 0;
-                    for buf in bufs.iter_mut() {
-                        match file.write(buf) {
-                            Ok(0) => break,
-                            Ok(n) => total = total.wrapping_add(n as i32),
-                            Err(_) => {
-                                err = -5;
-                                break;
-                            }
-                        }
-                    }
-                    if total == 0 && err != 0 {
-                        err
-                    } else {
-                        total
-                    }
-                }
-                _ => -9,
-            },
-            // SEND/RECV: socket send/recv via a readiness wait + nonblocking I/O,
-            // so a blocking RECV on an empty socket never wedges the single
-            // serial worker. MSG_DONTWAIT skips the wait and returns -EAGAIN.
-            OP_SEND | OP_RECV => match (op.file, op.buf) {
-                (Some(file), Some(mut bufs)) => {
-                    let is_read = op.opcode == OP_RECV;
-                    let dontwait = op.msg_flags & MSG_DONTWAIT != 0;
-                    recv_or_send(&file, &mut bufs, is_read, dontwait)
-                }
-                _ => -9,
-            },
-            // POLL_ADD: park the worker on this fd until the requested events
-            // fire. The worker is the coroutine — no separate task needed.
-            OP_POLL_ADD => match op.file {
-                Some(file) => {
-                    let events = IoEvents::from_bits_truncate(op.poll_events);
-                    block_on(poll_fn(move |cx| {
-                        let cur = file.poll();
-                        if cur.intersects(events) {
-                            Poll::Ready(cur.bits() as i32)
-                        } else {
-                            file.register(cx, events);
-                            Poll::Pending
-                        }
-                    }))
-                }
-                None => -9,
-            },
-            _ => -38,
-        };
-        // op.cq_pages 保持存活直至 CQE 写入
-        post_cqe(&op.cq, &op.overflow, &op.cq_wq, op.user_data, res);
-    }
+    });
 }
 
 /// Boot-time self-test: submit one NOP through the shared SQ ring, drive the

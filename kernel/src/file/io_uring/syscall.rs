@@ -22,7 +22,10 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<io_uring_params>) ->
         params.flags = 0;
         params.sq_thread_cpu = 0;
         params.sq_thread_idle = 0;
-        params.features = 0;
+        // Advertise IORING_FEAT_NODROP: our CQ overflow is replay-buffered
+        // (post_cqe never silently drops), so a userspace liburing that checks
+        // this feature knows it can rely on no-drop semantics.
+        params.features = linux_raw_sys::io_uring::IORING_FEAT_NODROP;
         params.wq_fd = 0;
         IoRing::fill_offsets(&mut params.sq_off, &mut params.cq_off);
     }

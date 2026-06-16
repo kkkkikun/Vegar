@@ -144,3 +144,24 @@ Socket（`kernel/src/file/net.rs`）已 impl `FileLike`（read=recv, write=send�
 - **网络通用化**：ACCEPT / RECV / SEND（含 MSG_DONTWAIT→EAGAIN）跑通，**loopback TCP echo 端到端**（无需 NIC）。pipe / `/dev/zero` / socket 全走同一条 worker 路径，**零改动 `net.rs`**——通用性成立。
 - **批量摊销**：iodepth 基准量化了 O(1) vs O(N) 的 batching 优势。
 
+---
+
+## Stage 1.5：单核多路复用 worker（修队头阻塞）— ✅ 完成并验证
+
+**问题（约束：初赛单核 smp=1，SMP 搁置）**：原 `global_worker` 串行处理——`queue.pop()` 后对每个 op `block_on`/`file.read`，worker **卡在单个 op 上**（队头阻塞）。N 个并发连接的 N 个 pending RECV 被串行化，单核事件驱动并发（io_uring 的核心单核价值）拿不到。axtask 任务栈 256KB，「每 op spawn 任务」会退回 O(N) 栈、丢掉内存优势。
+
+**改造**（`kernel/src/file/io_uring/mod.rs`）：worker 变成**多路复用事件循环**——
+- 新增 `OpFuture`：手写 `impl Future`（非 async fn，故 `Unpin`），把每个 op 变成「就绪检查（`Pollable::poll`）→ 未就绪则 `register(worker waker)`+`Pending`；就绪则 `set_nonblocking` + read/write」的状态机。对 pipe/socket/file/device 通用（`recv_or_send` 删去，逻辑并入 `OpFuture::poll_rw`）。
+- `global_worker` 重写为 `block_on(async { poll_fn(|cx| { try_pop 新 op；用 worker 自身 waker 轮询全部 in-flight `OpFuture`；完成就绪的→`post_cqe`；全 pending 则 `register_worker` 后 park }) })`。任一资源就绪或新 op 入队都唤醒同一 worker waker。
+- `OpQueue` 改 `worker_waker: Mutex<Option<Waker>>` + `try_pop()` + `register_worker(cx)`；`push` 唤醒 worker。`WaitQueue::wait_until`-based `wait_for_completions`/`post_cqe` 不变。
+- 一致性小补：`sys_io_uring_setup` 回填 `params.features = IORING_FEAT_NODROP`（声明溢出重放）。
+
+**结果（QEMU `-smp 1`）**：
+- **回归**：原 13 项 io_uring 测试在新多路复用 worker 下**全过，0 panic**——证明改造不破坏正确性（pipe READ/WRITE、socket SEND/RECV、POLL_ADD、GETEVENTS、ACCEPT 均正常）。
+- **并发 echo**（`io_uring_echo.c`，照搬 tokio-rs `tcp_echo.rs` 事件循环经 liburing shim）：单线程 `submit_and_wait(1)` 循环 + token 状态机 `ACCEPT→RECV→SEND`，**24 个并发 TCP 客户端**各发独立 payload，由**同一个**多路复用 worker 回显——`accepted=24 echoed=24 failed=0 clients_ok=24/24`，逐连接字节正确、不串不丢。
+- **意义**：单核下 io_uring 真正实现**事件驱动并发**——1 个 worker（O(1) 内存：1 栈 + 环页）多路复用 N 个在途 op，而「线程/连接」阻塞模型需 N × 256KB 栈。队头阻塞消除（慢连接不阻塞快连接）。
+
+> 踩坑：首版 echo 过度订阅 ACCEPT（每个完成的 ACCEPT 都补一个，总队列 > 客户端数），多余 ACCEPT 在 `complete_accept` 里永久等连接、死锁提交者。修复：`accept_queued` 计数封顶 NCLIENTS。**这是测试逻辑 bug，非 worker bug**。
+
+**标准对齐**：参考 `ref/io-uring`（tokio-rs io-uring v0.7.12）。ABI 已一致（核实 `src/sys/sys_riscv64.rs`：syscall 425/426/427、offset、SQE/CQE 尺寸）。`examples/tcp_echo.rs` 正是需要多路复用的标准用例，故 echo 照搬其模式。**下一步**：安装 riscv64 Linux Rust 目标，直接交叉编译并运行原版 `io-uring-test`（用户态 Rust），做最严格的第三方验证。
+

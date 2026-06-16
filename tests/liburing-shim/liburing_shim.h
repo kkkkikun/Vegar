@@ -180,5 +180,11 @@ static inline void io_uring_prep_accept(struct io_uring_sqe *sqe, int fd,
     io_uring_prep_rw(sqe, IORING_OP_ACCEPT, fd, addr, addrlen ? *addrlen : 0, 0);
     sqe->accept_flags = flags;
 }
+static inline void io_uring_prep_poll_add(struct io_uring_sqe *sqe, int fd,
+                                          unsigned poll_mask) {
+    /* poll_mask (e.g. POLLIN=1) goes in the poll32_events union slot. */
+    io_uring_prep_rw(sqe, IORING_OP_POLL_ADD, fd, NULL, 0, 0);
+    sqe->poll32_events = poll_mask;
+}
 
 #endif /* LIBURING_SHIM_H */
