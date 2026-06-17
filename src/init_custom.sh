@@ -90,6 +90,30 @@ run_iouring io_uring_shim_test
 run_iouring io_uring_send_recv
 run_iouring io_uring_accept
 run_iouring io_uring_iodepth
+run_iouring io_uring_echo
+
+# =========================================================================
+# tokio-rs io-uring-test: the REAL upstream suite (statically cross-compiled).
+# Run supported-opcode tests individually by name — the target arg makes
+# require! run only that test (avoids hangs on SQPOLL/TIMEOUT/CANCEL, which we
+# don't support). A pass shows "Test count" in output; the suite then exits
+# non-zero because test_sqpoll fails on our non-SQPOLL kernel — that's expected.
+# =========================================================================
+run_iouringtest() {
+    t="$1"
+    if [ -f "/io_uring_test" ]; then
+        /musl/busybox cp /io_uring_test /tmp/ut
+        /musl/busybox chmod +x /tmp/ut
+        echo "===== [upstream io-uring-test] $t ====="
+        /musl/busybox timeout 20 /tmp/ut "$t" 2>&1 | /musl/busybox tail -12
+        echo "===== [upstream io-uring-test] $t end ====="
+    else
+        echo "===== [upstream io-uring-test] /io_uring_test NOT FOUND ====="
+    fi
+}
+for t in test_nop test_batch test_queue_split test_tcp_write_read test_tcp_writev_readv test_tcp_send_recv test_tcp_accept test_pipe test_register_buffers test_file_write_read; do
+    run_iouringtest "$t"
+done
 
 # =========================================================================
 # Helper: run one test with timeout

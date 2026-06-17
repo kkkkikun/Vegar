@@ -163,5 +163,33 @@ Socket（`kernel/src/file/net.rs`）已 impl `FileLike`（read=recv, write=send�
 
 > 踩坑：首版 echo 过度订阅 ACCEPT（每个完成的 ACCEPT 都补一个，总队列 > 客户端数），多余 ACCEPT 在 `complete_accept` 里永久等连接、死锁提交者。修复：`accept_queued` 计数封顶 NCLIENTS。**这是测试逻辑 bug，非 worker bug**。
 
-**标准对齐**：参考 `ref/io-uring`（tokio-rs io-uring v0.7.12）。ABI 已一致（核实 `src/sys/sys_riscv64.rs`：syscall 425/426/427、offset、SQE/CQE 尺寸）。`examples/tcp_echo.rs` 正是需要多路复用的标准用例，故 echo 照搬其模式。**下一步**：安装 riscv64 Linux Rust 目标，直接交叉编译并运行原版 `io-uring-test`（用户态 Rust），做最严格的第三方验证。
+**标准对齐**：参考 `ref/io-uring`（tokio-rs io-uring v0.7.12）。ABI 已一致（核实 `src/sys/sys_riscv64.rs`：syscall 425/426/427、offset、SQE/CQE 尺寸）。`examples/tcp_echo.rs` 正是需要多路复用的标准用例，故 echo 照搬其模式。
+
+---
+
+## 原版 tokio-rs `io-uring-test` 上机验证 — ✅ 6/10 通过
+
+把 **原版** `io-uring-test` 二进制（用户态 Rust，静态交叉编译 `riscv64gc-unknown-linux-musl` + `+crt-static`，nightly-2026-02-25）跑在 StarryOS 单核 QEMU 上。工具链坑：0.7.12 的测试代码同时依赖旧 Rust（`*mut T: Default`）和新 Rust（`std::io::pipe`/`integer_sign_cast`），无单一版本可编；以 `--features ci`（剔除 musl 不兼容的 `test_statx` 与大 CQE 测试）+ 容器 2026 nightly + 静态链接 + 用户手改 `musl_statx`（裸 syscall 291）解决。新增内核 `IORING_REGISTER_PROBE`（opcode 8，回填支持的操作码表），否则 `require!` 的 `probe.is_supported()` 全 false、所有操作码测试被跳过。
+
+**结果（`-smp 1`，按名逐个跑，避开 SQPOLL/TIMEOUT/CANCEL）**：
+
+| 测试 | 结果 | 说明 |
+|---|---|---|
+| `test_nop` | ✅ PASS | NOP 往返 |
+| `test_batch` | ✅ PASS | NOP 批量 + SQ/CQ |
+| `test_queue_split` | ✅ PASS | SQ/CQ split 机制 |
+| `test_tcp_write_read` | ✅ PASS | TCP Write+Read（IO_LINK 序保持） |
+| `test_tcp_send_recv` | ✅ PASS | TCP Send/Recv |
+| `test_tcp_accept` | ✅ PASS | TCP Accept |
+| `test_pipe` | ⏭ skip | std::io::pipe gate 未满足 |
+| `test_tcp_writev_readv` | ❌ FAIL | Writev=80 ✓ 但 **Readv=44** |
+| `test_register_buffers` | ❌ FAIL | READ_FIXED=0（期望 4096） |
+| `test_file_write_read` | ❌ FAIL | Write=44 ✓ 但 **Read=0** |
+
+**两个已定位的真 bug（待修）**：
+1. **READV 分块过读**：worker 逐 iovec 调 `file.read`（每次一个 recv）。当一次 recv 的可用数据 > 当前 iovec 容量时，`PinnedUserBuf::copy_in` 按 iovec 容量截断，**多余字节被丢弃**（readv 80B 数据，第一个 44B iovec 收 44，丢 36）。单缓冲（write_read）不触发。修法：READV 应一次读满所有 iovec，或让 recv 读量 ≤ 当前 iovec `remaining_mut`。
+2. **文件 `sqe.off` 未生效**：READ/WRITE/READ_FIXED/WRITE_FIXED 忽略 `sqe.off`，用 fd 当前位置。文件 Write 推进 fd 位置后，Read 读到 EOF（`test_file_write_read`）或错位（`test_register_buffers`）。修法：按 `sqe.off` 做 pread/pwrite（off=-1 时用当前位置）。管道/socket 不受影响（stream，忽略 off），故 `test_tcp_*` 全过。
+
+> 持久容器 `iouring-dev`（`--privileged --network host`，仓库挂 `/workspace`）做交叉编译；构建命令在容器内 `/tmp/iouring`（避开仓库 vendor 配置）：`cargo +nightly-2026-02-25 build --features ci --target riscv64gc-unknown-linux-musl --release -p io-uring-test`（`RUSTFLAGS=-C target-feature=+crt-static`，linker=`riscv64-linux-musl-gcc`）。
+
 

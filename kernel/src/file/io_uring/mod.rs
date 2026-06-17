@@ -564,6 +564,49 @@ impl IoRing {
         Ok(())
     }
 
+    /// `IORING_REGISTER_PROBE`: fill the user-provided `io_uring_probe` with the
+    /// opcodes we support, so a liburing consumer (e.g. tokio-rs `io-uring-test`)
+    /// can gate its opcode tests via `probe.is_supported(op)` instead of skipping
+    /// them. Layout: 16-byte header `{last_op, ops_len, ...}` then `ops[op] =
+    /// {op, _, flags, _}` (8 bytes each); `flags & IO_URING_OP_SUPPORTED(=1)`
+    /// marks a supported opcode. `is_supported(op)` ⇒ `op <= last_op && ops[op].
+    /// flags & 1`.
+    pub(crate) fn register_probe(&self, arg: usize, nr: u32) -> AxResult<()> {
+        #[repr(C)]
+        struct ProbeHead {
+            last_op: u8,
+            ops_len: u8,
+            _resv: u16,
+            _resv2: [u32; 3],
+        }
+        #[repr(C)]
+        struct ProbeOp {
+            op: u8,
+            _resv: u8,
+            flags: u16,
+            _resv2: u32,
+        }
+        const SUPPORTED: &[u8] = &[
+            OP_NOP, OP_READV, OP_WRITEV, OP_READ_FIXED, OP_WRITE_FIXED, OP_POLL_ADD,
+            OP_ACCEPT, OP_READ, OP_WRITE, OP_SEND, OP_RECV,
+        ];
+        let last_op: u8 = *SUPPORTED.iter().max().unwrap(); // RECV = 27
+
+        let head: crate::mm::UserPtr<ProbeHead> = arg.into();
+        let h = head.get_as_mut()?;
+        h.last_op = last_op;
+        h.ops_len = last_op + 1;
+
+        let n = (last_op as usize + 1).min(nr.min(256) as usize);
+        let ops: crate::mm::UserPtr<ProbeOp> = (arg + 16).into();
+        let ops_slice = ops.get_as_mut_slice(n)?;
+        for (i, opref) in ops_slice.iter_mut().enumerate() {
+            opref.op = i as u8;
+            opref.flags = if SUPPORTED.contains(&(i as u8)) { 1 } else { 0 };
+        }
+        Ok(())
+    }
+
     /// Select the SharedPages region for `mmap` at the given io_uring offset.
     pub fn shared_pages_for_offset(&self, offset: usize) -> AxResult<Arc<SharedPages>> {
         match offset as u32 {

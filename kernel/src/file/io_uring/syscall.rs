@@ -91,8 +91,15 @@ pub fn sys_io_uring_register(fd: i32, opcode: u32, arg: usize, nr_args: u32) -> 
     debug!("sys_io_uring_register <= opcode: {opcode}, nr_args: {nr_args}");
     // IORING_REGISTER_BUFFERS = 0 in the io_uring_register_op enum.
     if opcode == 0 {
+        // IORING_REGISTER_BUFFERS
         let ring = IoRing::from_fd(fd)?;
         ring.register_buffers(arg, nr_args)?;
+        Ok(0)
+    } else if opcode == 8 {
+        // IORING_REGISTER_PROBE — report supported opcodes so liburing consumers
+        // (tokio-rs io-uring-test) run their opcode tests instead of skipping.
+        let ring = IoRing::from_fd(fd)?;
+        ring.register_probe(arg, nr_args)?;
         Ok(0)
     } else {
         Err(AxError::Unsupported)
