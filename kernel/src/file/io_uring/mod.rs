@@ -13,12 +13,13 @@
 
 pub mod syscall;
 
-use alloc::{borrow::Cow, collections::VecDeque, format, sync::Arc, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::VecDeque, format, sync::Arc, vec::Vec};
 use core::{
     future::{poll_fn, Future},
     pin::Pin,
     sync::atomic::{AtomicU32, Ordering},
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 use axerrno::{AxError, AxResult};
@@ -27,7 +28,11 @@ use axio::{IoBuf, IoBufMut, Read, Write};
 use axnet::SocketOps;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use axtask::{WaitQueue, current, future::block_on, spawn_with_name, yield_now};
+use axtask::{
+    WaitQueue, current,
+    future::{block_on, sleep},
+    spawn_with_name, yield_now,
+};
 use lazy_static::lazy_static;
 use linux_raw_sys::io_uring as iouring;
 use memory_addr::{PhysAddr, VirtAddr};
@@ -70,6 +75,12 @@ const OP_POLL_ADD: u8 = iouring::io_uring_op::IORING_OP_POLL_ADD as u8;
 const OP_SEND: u8 = iouring::io_uring_op::IORING_OP_SEND as u8;
 const OP_RECV: u8 = iouring::io_uring_op::IORING_OP_RECV as u8;
 const OP_ACCEPT: u8 = iouring::io_uring_op::IORING_OP_ACCEPT as u8;
+const OP_TIMEOUT: u8 = iouring::io_uring_op::IORING_OP_TIMEOUT as u8;
+/// Internal marker (not a real io_uring opcode): a READ_FIXED/WRITE_FIXED whose
+/// registered-buffer index was unfilled/sparse. Completes with -EFAULT.
+const OP_FIXED_FAULT: u8 = 0xfd;
+/// CQE result for a fired relative timer (matches Linux io_uring semantics).
+const ENETIME: i32 = -62;
 
 /// `MSG_DONTWAIT` — recv/send without blocking (skip the readiness wait).
 const MSG_DONTWAIT: u32 = 0x40;
@@ -216,6 +227,9 @@ struct Op {
     msg_flags: u32,
     /// File offset for READ/WRITE (sqe.off). u64::MAX means "use current position".
     offset: u64,
+    /// For OP_TIMEOUT: the relative duration parsed from the sqe timespec
+    /// (`Duration::ZERO` for all other opcodes).
+    duration: Duration,
     /// This op's CQ ring view + the pages that back it (keepalive: the pages
     /// stay pinned until the CQE is posted, even if the fd is already closed).
     cq: CqRing,
@@ -242,6 +256,11 @@ struct OpFuture {
     poll_events: u32,
     msg_flags: u32,
     offset: u64,
+    duration: Duration,
+    /// For OP_TIMEOUT: the backing `sleep` future, lazily created on first poll
+    /// (in the worker context — `wall_time()` is read there). `Pin<Box<…>>` is
+    /// `Unpin`, so `OpFuture` stays storable in a `VecDeque` without re-pinning.
+    timer: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     cq: CqRing,
     cq_pages: Arc<SharedPages>,
     cq_wq: Arc<WaitQueue>,
@@ -262,6 +281,7 @@ impl From<Op> for OpFuture {
             poll_events,
             msg_flags,
             offset,
+            duration,
             cq,
             cq_pages,
             cq_wq,
@@ -275,6 +295,8 @@ impl From<Op> for OpFuture {
             poll_events,
             msg_flags,
             offset,
+            duration,
+            timer: None,
             cq,
             cq_pages,
             cq_wq,
@@ -451,6 +473,20 @@ impl Future for OpFuture {
             },
             OP_READ | OP_RECV => self.poll_rw(cx, true),
             OP_WRITE | OP_SEND => self.poll_rw(cx, false),
+            OP_FIXED_FAULT => Poll::Ready(-14), // EFAULT: fixed buffer index unfilled
+            OP_TIMEOUT => {
+                // Lazily arm the backing sleep future on first poll (worker
+                // context), then drive it. When it fires, complete with -ETIME.
+                // The TimerFuture registered the worker's waker with the kernel
+                // timer wheel, so the worker is re-poled when the deadline hits.
+                if self.timer.is_none() {
+                    self.timer = Some(Box::pin(sleep(self.duration)));
+                }
+                match self.timer.as_mut().unwrap().as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(ENETIME),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
             _ => Poll::Ready(-38),
         }
     }
@@ -528,7 +564,7 @@ pub struct IoRing {
     sqes_pages: Arc<SharedPages>,
     sq: SqRing,
     cq: CqRing,
-    registered_bufs: Mutex<Vec<Option<PinnedUserBuf>>>,
+    registered_bufs: Mutex<Vec<Option<(PinnedUserBuf, u64)>>>,
     /// Waiters blocked in `io_uring_enter(GETEVENTS)` are parked here; the
     /// worker wakes them from `post_cqe` once CQEs appear.
     cq_wq: Arc<WaitQueue>,
@@ -626,7 +662,8 @@ impl IoRing {
 
     /// Register a batch of user buffers (`IORING_REGISTER_BUFFERS`).
     /// `arg` points to an array of iovec; each is resolved to phys pages via
-    /// `PinnedUserBuf::resolve` (submitter's page table is live).
+    /// `PinnedUserBuf::resolve` (submitter's page table is live). No tags
+    /// (tag = 0) — use `register_buffers2` for tagged registration.
     pub(crate) fn register_buffers(&self, arg: usize, nr: u32) -> AxResult<()> {
         #[repr(C)]
         struct IoVec {
@@ -640,7 +677,7 @@ impl IoRing {
             let iov_ptr: crate::mm::UserConstPtr<IoVec> = (arg + i * 16).into();
             let iov = iov_ptr.get_as_ref()?;
             if iov.len > 0 {
-                table[i] = Some(PinnedUserBuf::resolve(iov.base, iov.len)?);
+                table[i] = Some((PinnedUserBuf::resolve(iov.base, iov.len)?, 0));
             }
         }
         Ok(())
@@ -655,19 +692,67 @@ impl IoRing {
         Ok(())
     }
 
+    /// `IORING_REGISTER_BUFFERS2`: tagged buffer registration. `arg` points to
+    /// `io_uring_rsrc_register { nr, flags, resv2, data, tags }` (32 bytes).
+    /// With `IORING_RSRC_REGISTER_SPARSE` (flags & 1) it allocates an all-`None`
+    /// table of `nr` slots (filled later via `register_buffers_update`).
+    const IORING_RSRC_REGISTER_SPARSE: u32 = 1;
+    pub(crate) fn register_buffers2(&self, arg: usize, _nr_args: u32) -> AxResult<()> {
+        #[repr(C)]
+        struct IoUringRsrcRegister {
+            nr: u32,
+            flags: u32,
+            _resv2: u64,
+            data: u64, // -> iovec array (0 for sparse)
+            tags: u64, // -> u64 tag array (0 for none)
+        }
+        #[repr(C)]
+        struct IoVec {
+            base: usize,
+            len: usize,
+        }
+        let r: crate::mm::UserConstPtr<IoUringRsrcRegister> = arg.into();
+        let r = r.get_as_ref()?;
+        let n = r.nr as usize;
+        let mut table = self.registered_bufs.lock();
+        if r.flags & Self::IORING_RSRC_REGISTER_SPARSE != 0 {
+            // Sparse: pre-allocate the table, all slots unfilled.
+            table.clear();
+            table.resize_with(n, || None);
+            return Ok(());
+        }
+        table.resize_with(n, || None);
+        for i in 0..n {
+            let iov_ptr: crate::mm::UserConstPtr<IoVec> = ((r.data as usize) + i * 16).into();
+            let iov = iov_ptr.get_as_ref()?;
+            let tag = if r.tags != 0 {
+                let tag_ptr: crate::mm::UserConstPtr<u64> = ((r.tags as usize) + i * 8).into();
+                tag_ptr.get_as_ref().map(|t| *t).unwrap_or(0)
+            } else {
+                0
+            };
+            if iov.len > 0 {
+                table[i] = Some((PinnedUserBuf::resolve(iov.base, iov.len)?, tag));
+            }
+        }
+        Ok(())
+    }
+
     /// `IORING_REGISTER_BUFFERS_UPDATE`: replace a contiguous range of the
     /// registered-buffer table starting at `offset`. `arg` points to an
     /// `io_uring_rsrc_update2 { offset, _resv, data, tags, nr, _resv2 }`
-    /// (32 bytes), where `data` is an iovec array and `nr` is its length.
-    /// Sparse slots (`len == 0`) clear the table entry. The table auto-grows
-    /// with `None` to cover `offset + nr`.
+    /// (32 bytes). Each entry's new tag comes from the `tags` array. When an
+    /// already-registered slot with a **non-zero old tag** is replaced, the
+    /// kernel posts a CQE with `user_data == old_tag` to signal the resource is
+    /// released (this is the `IORING_FEAT_RSRC_TAGS` contract). Filling a sparse
+    /// (`None`) slot posts no CQE. The table auto-grows with `None`.
     pub(crate) fn register_buffers_update(&self, arg: usize, _nr_args: u32) -> AxResult<()> {
         #[repr(C)]
         struct IoUringRsrcUpdate2 {
             offset: u32,
             _resv: u32,
-            data: u64, // -> iovec array
-            _tags: u64,
+            data: u64,  // -> iovec array
+            tags: u64, // -> u64 tag array (0 if none)
             nr: u32,
             _resv2: u32,
         }
@@ -680,18 +765,40 @@ impl IoRing {
         let u = upd.get_as_ref()?;
         let off = u.offset as usize;
         let n = u.nr as usize;
-        let mut table = self.registered_bufs.lock();
-        if off + n > table.len() {
-            table.resize_with(off + n, || None);
+        // Collect (old_tag) CQEs to post for replaced tagged slots. Done after
+        // dropping the table lock so post_cqe (which locks `overflow`) doesn't
+        // nest under registered_bufs.
+        let mut released_tags: Vec<u64> = Vec::new();
+        {
+            let mut table = self.registered_bufs.lock();
+            if off + n > table.len() {
+                table.resize_with(off + n, || None);
+            }
+            for i in 0..n {
+                let iov_ptr: crate::mm::UserConstPtr<IoVec> = ((u.data as usize) + i * 16).into();
+                let iov = iov_ptr.get_as_ref()?;
+                let new_tag = if u.tags != 0 {
+                    let tag_ptr: crate::mm::UserConstPtr<u64> = ((u.tags as usize) + i * 8).into();
+                    tag_ptr.get_as_ref().map(|t| *t).unwrap_or(0)
+                } else {
+                    0
+                };
+                // Replacing a registered slot whose old tag is non-zero posts a
+                // resource-released CQE carrying the OLD tag as user_data.
+                if let Some((_, old_tag)) = table[off + i] {
+                    if old_tag != 0 {
+                        released_tags.push(old_tag);
+                    }
+                }
+                table[off + i] = if iov.len > 0 {
+                    Some((PinnedUserBuf::resolve(iov.base, iov.len)?, new_tag))
+                } else {
+                    None
+                };
+            }
         }
-        for i in 0..n {
-            let iov_ptr: crate::mm::UserConstPtr<IoVec> = ((u.data as usize) + i * 16).into();
-            let iov = iov_ptr.get_as_ref()?;
-            table[off + i] = if iov.len > 0 {
-                Some(PinnedUserBuf::resolve(iov.base, iov.len)?)
-            } else {
-                None
-            };
+        for tag in released_tags {
+            post_cqe(&self.cq, &self.overflow, &self.cq_wq, tag, 0);
         }
         Ok(())
     }
@@ -720,7 +827,7 @@ impl IoRing {
         }
         const SUPPORTED: &[u8] = &[
             OP_NOP, OP_READV, OP_WRITEV, OP_READ_FIXED, OP_WRITE_FIXED, OP_POLL_ADD,
-            OP_ACCEPT, OP_READ, OP_WRITE, OP_SEND, OP_RECV,
+            OP_ACCEPT, OP_READ, OP_WRITE, OP_SEND, OP_RECV, OP_TIMEOUT,
         ];
         let last_op: u8 = *SUPPORTED.iter().max().unwrap(); // RECV = 27
 
@@ -829,6 +936,7 @@ impl IoRing {
             // For FIXED variants, clone a pre-registered buffer (no page walk).
             let mut poll_events = 0u32;
             let mut msg_flags = 0u32;
+            let mut duration = Duration::ZERO;
             let (file, buf, use_opcode) = match sqe.opcode {
                 OP_READ | OP_WRITE => {
                     let file = get_file_like(sqe.fd).ok();
@@ -874,23 +982,47 @@ impl IoRing {
                 OP_READ_FIXED | OP_WRITE_FIXED => {
                     let file = get_file_like(sqe.fd).ok();
                     let idx = unsafe { sqe.__bindgen_anon_4.buf_index as usize };
-                    let buf = self
-                        .registered_bufs
-                        .lock()
-                        .get(idx)
-                        .and_then(Option::as_ref)
-                        .map(PinnedUserBuf::clone)
-                        .map(|b| alloc::vec![b]);
-                    let oc = if sqe.opcode == OP_READ_FIXED {
-                        OP_READ
-                    } else {
-                        OP_WRITE
-                    };
-                    (file, buf, oc)
+                    let slot = self.registered_bufs.lock().get(idx).cloned();
+                    match slot {
+                        Some(Some((b, _tag))) => {
+                            let oc = if sqe.opcode == OP_READ_FIXED {
+                                OP_READ
+                            } else {
+                                OP_WRITE
+                            };
+                            (file, Some(alloc::vec![b]), oc)
+                        }
+                        // Sparse / unfilled slot (or out-of-range index) →
+                        // -EFAULT: the user asked to use a fixed buffer that
+                        // isn't registered at that index.
+                        _ => (file, None, OP_FIXED_FAULT),
+                    }
                 }
                 OP_POLL_ADD => {
                     poll_events = unsafe { sqe.__bindgen_anon_3.poll32_events };
                     (get_file_like(sqe.fd).ok(), None, sqe.opcode)
+                }
+                OP_TIMEOUT => {
+                    // sqe.addr -> __kernel_timespec { tv_sec: i64, tv_nsec: i64 }.
+                    // Relative timer (the test form); ABS flags are ignored.
+                    #[repr(C)]
+                    struct Timespec {
+                        tv_sec: i64,
+                        tv_nsec: i64,
+                    }
+                    let ts_ptr: usize = unsafe { sqe.__bindgen_anon_2.addr as usize };
+                    let dur = crate::mm::UserConstPtr::<Timespec>::from(ts_ptr)
+                        .get_as_ref()
+                        .ok()
+                        .map(|ts| {
+                            Duration::new(
+                                ts.tv_sec.max(0) as u64,
+                                ts.tv_nsec.max(0) as u32,
+                            )
+                        })
+                        .unwrap_or(Duration::ZERO);
+                    duration = dur;
+                    (None, None, sqe.opcode)
                 }
                 _ => (None, None, sqe.opcode),
             };
@@ -902,6 +1034,7 @@ impl IoRing {
                 poll_events,
                 msg_flags,
                 offset: unsafe { sqe.__bindgen_anon_1.off },
+                duration,
                 cq: self.cq,
                 cq_pages: self.cq_ring_pages.clone(),
                 cq_wq: self.cq_wq.clone(),

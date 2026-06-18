@@ -25,7 +25,14 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<io_uring_params>) ->
         // Advertise IORING_FEAT_NODROP: our CQ overflow is replay-buffered
         // (post_cqe never silently drops), so a userspace liburing that checks
         // this feature knows it can rely on no-drop semantics.
-        params.features = linux_raw_sys::io_uring::IORING_FEAT_NODROP;
+        //
+        // IORING_FEAT_RSRC_TAGS (0x400): we honor per-buffer tags and post a
+        // resource-released CQE (user_data = old tag) when a tagged registered
+        // buffer is replaced via REGISTER_BUFFERS_UPDATE. Required for
+        // test_register_buffers_update to run.
+        const IORING_FEAT_RSRC_TAGS: u32 = 1024;
+        params.features =
+            linux_raw_sys::io_uring::IORING_FEAT_NODROP | IORING_FEAT_RSRC_TAGS;
         params.wq_fd = 0;
         IoRing::fill_offsets(&mut params.sq_off, &mut params.cq_off);
     }
@@ -93,6 +100,7 @@ pub fn sys_io_uring_register(fd: i32, opcode: u32, arg: usize, nr_args: u32) -> 
     // sparse/optional variants tripping the build).
     const IORING_REGISTER_BUFFERS: u32 = 0;
     const IORING_UNREGISTER_BUFFERS: u32 = 1;
+    const IORING_REGISTER_BUFFERS2: u32 = 15;
     const IORING_REGISTER_PROBE: u32 = 8;
     const IORING_REGISTER_BUFFERS_UPDATE: u32 = 16;
     match opcode {
@@ -108,6 +116,13 @@ pub fn sys_io_uring_register(fd: i32, opcode: u32, arg: usize, nr_args: u32) -> 
             ring.unregister_buffers()?;
             Ok(0)
         }
+        IORING_REGISTER_BUFFERS2 => {
+            // Tagged registration; supports sparse tables
+            // (IORING_RSRC_REGISTER_SPARSE) used by test_register_buffers_update.
+            let ring = IoRing::from_fd(fd)?;
+            ring.register_buffers2(arg, nr_args)?;
+            Ok(0)
+        }
         IORING_REGISTER_PROBE => {
             // Report supported opcodes so liburing consumers (tokio-rs
             // io-uring-test) run their opcode tests instead of skipping.
@@ -116,7 +131,8 @@ pub fn sys_io_uring_register(fd: i32, opcode: u32, arg: usize, nr_args: u32) -> 
             Ok(0)
         }
         IORING_REGISTER_BUFFERS_UPDATE => {
-            // Replace a range of the registered-buffer table (rsrc_update2).
+            // Replace a range of the registered-buffer table (rsrc_update2);
+            // posts a tag CQE when a tagged slot is replaced.
             let ring = IoRing::from_fd(fd)?;
             ring.register_buffers_update(arg, nr_args)?;
             Ok(0)

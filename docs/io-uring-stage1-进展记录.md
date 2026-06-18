@@ -237,3 +237,37 @@ Socket（`kernel/src/file/net.rs`）已 impl `FileLike`（read=recv, write=send�
 ### 架构意义
 
 io_uring worker 现在对**所有驱动类型**（文件/管道/socket）说同一种 async trait 语言。新驱动只需 impl `FileLike` 的 `poll_read`/`poll_write` 即可被多路复用，零修改接入——这正是竞赛 ③「通用性 / 驱动跨 OS 复用」的核心论据。`set_nonblocking` toggle 从"worker 的隐式假设"变为"驱动自己的实现细节"。
+
+---
+
+## Stage 2.5：RSRC_TAGS + TIMEOUT → ✅ 10/11 通过（`test_register_buffers_update` 过关）
+
+最后一个上游测试 `test_register_buffers_update` 需要全套资源标签基础设施 + TIMEOUT opcode。这是套件里最硬的一个，一次性补齐 6 项能力：
+
+### 新增能力
+
+1. **`IORING_FEAT_RSRC_TAGS` feature 声明**（`params.features |= 0x400`）：否则测试的 `require!(is_feature_resource_tagging())` 直接 skip。
+
+2. **per-slot tag 存储**：`registered_bufs` 由 `Vec<Option<PinnedUserBuf>>` 改为 `Vec<Option<(PinnedUserBuf, u64)>>`，每个槽带 tag。register_buffers(op0) tag=0；register_buffers2(op15) 从 tags 数组读。
+
+3. **`REGISTER_BUFFERS2`（opcode 15）+ 稀疏注册**：解析 `io_uring_rsrc_register { nr, flags, data, tags }`，`flags & IORING_RSRC_REGISTER_SPARSE` 时分配全 `None` 的 `nr` 槽表（事后用 update 填）。
+
+4. **`REGISTER_BUFFERS_UPDATE`（opcode 16）tag 语义**：替换槽时若旧槽 `Some((_, old_tag))` 且 `old_tag != 0`，**post 一个 CQE**（`user_data = old_tag`，资源释放通知）。填稀疏（None）槽不发 CQE。这正是 `FEAT_RSRC_TAGS` 的契约。
+
+5. **`ReadFixed`/`WriteFixed` 撞稀疏（None）槽 → CQE `-EFAULT`**：内部标记 opcode `OP_FIXED_FAULT`，`OpFuture::poll` 直接 `Ready(-14)`。原本返 -9（EBADF），测试要 -EFAULT。
+
+6. **`IORING_OP_TIMEOUT`（opcode 11）**：解析 `__kernel_timespec`（sqe.addr）算 duration，`OpFuture` 持 `Pin<Box<dyn Future<Output=()>>>`（`axtask::future::sleep` 的返回值，惰性创建于首次 poll），到期 post CQE `-ETIME`(-62)。`TimerFuture` 把 worker 的 waker 注册进内核定时轮，`on_timer_tick` 到点唤醒 worker。**`Pin<Box<_>>` 是 `Unpin`，`OpFuture` 仍可存于 `VecDeque`**。
+
+### 关键工程点
+
+- **post_cqe 从 register 路径（提交者上下文）调用**：register_buffers_update 在 `sys_io_uring_register`（提交者任务）里运行，需直接 post tag CQE。SMP=1 下提交者与 worker 协作调度（非真并发），post_cqe 单写者假设成立；先收集 `released_tags` 再 drop 表锁后 post，避免 `overflow` 锁嵌套在 `registered_bufs` 锁内。
+- **TIMEOUT 惰性创建 timer**：duration 在 submit_pending（提交者上下文）解析存入 Op，timer future 在 worker 首次 poll 时创建（读 wall_time）；故 submit 与 timer 注册分离。
+- **probe 加入 TIMEOUT**：`SUPPORTED` 加 `OP_TIMEOUT`，否则测试的 `require!(probe.is_supported(ReadFixed))` 之外，TIMEOUT sqe 会被当不支持 op 丢弃。
+
+### 结果（QEMU `-smp 1`）
+
+**10/11 上游 io-uring-test PASS**（test_pipe 仍 `std::io::pipe` feature-gated skip，非内核可修）。`test_register_buffers_update` 从 skip（无 RSRC_TAGS）→ PASS：稀疏表注册、ReadFixed 撞空槽 -EFAULT、update 填槽（无 CQE）、update 替换带 tag 槽（post old_tag CQE=0xbadcafe）、再读得 "yo"。
+
+> 副效应：声明 RSRC_TAGS 后 `test_register_buffers` 的 register_buffers2/sparse 子测试也启用（count 1→4），全过。
+
+**13/13 自测全过，0 panic。** opcode 覆盖：NOP/READV/WRITEV/READ_FIXED/WRITE_FIXED/POLL_ADD/ACCEPT/READ/WRITE/SEND/RECV/**TIMEOUT**(11) = 12 个。register opcodes：REGISTER_BUFFERS(0)/UNREGISTER_BUFFERS(1)/REGISTER_BUFFERS2(15)/REGISTER_PROBE(8)/REGISTER_BUFFERS_UPDATE(16) = 5 个。

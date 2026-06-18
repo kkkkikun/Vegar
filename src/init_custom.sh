@@ -111,7 +111,7 @@ run_iouringtest() {
         echo "===== [upstream io-uring-test] /io_uring_test NOT FOUND ====="
     fi
 }
-for t in test_nop test_batch test_queue_split test_tcp_write_read test_tcp_writev_readv test_tcp_send_recv test_tcp_accept test_pipe test_register_buffers test_file_write_read; do
+for t in test_nop test_batch test_queue_split test_tcp_write_read test_tcp_writev_readv test_tcp_send_recv test_tcp_accept test_pipe test_register_buffers test_register_buffers_update test_file_write_read; do
     run_iouringtest "$t"
 done
 
