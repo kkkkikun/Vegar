@@ -313,6 +313,13 @@ impl OpFuture {
     /// progress (`self.total`, `self.buf_offset`) and re-arms as Pending. On
     /// the next poll (woken when more data arrives), it resumes from the
     /// interrupted iovec — so a readv eventually completes with ALL bytes.
+    ///
+    /// This drives I/O **entirely through the `FileLike` async contract**
+    /// (`poll_read`/`poll_write` for the park path, `try_read`/`try_write` for
+    /// the `MSG_DONTWAIT` path). No `set_nonblocking` toggle lives here — each
+    /// driver owns its readiness strategy. That is the architectural payoff of
+    /// the `AsyncFileLike` migration: the worker talks the same async trait to
+    /// files, pipes, and sockets.
     fn poll_rw(&mut self, cx: &mut Context<'_>, is_read: bool) -> Poll<i32> {
         let file = match self.file.as_ref() {
             Some(f) => f.clone(),
@@ -324,17 +331,10 @@ impl OpFuture {
         };
         let dontwait = self.msg_flags & MSG_DONTWAIT != 0;
         let events = if is_read { IoEvents::IN } else { IoEvents::OUT };
-        if !dontwait && !file.poll().intersects(events) {
-            file.register(cx, events);
-            return Poll::Pending;
-        }
-        let was_nonblock = file.nonblocking();
-        if !was_nonblock {
-            let _ = file.set_nonblocking(true);
-        }
+
+        let mut hit_block = false;
         // Resume from the iovec that last got EAGAIN; earlier iovecs are full
         // (remaining_mut == 0) and get skipped.
-        let mut hit_err = false;
         let mut i = self.buf_offset;
         while i < bufs.len() {
             let buf = &mut bufs[i];
@@ -343,47 +343,84 @@ impl OpFuture {
                 self.buf_offset = i;
                 continue;
             }
-            let r = if is_read {
-                if self.offset != u64::MAX {
-                    file.read_at(buf, self.offset).or_else(|_| file.read(buf))
+
+            if dontwait {
+                // Single non-blocking shot: never park. Report -EAGAIN if the
+                // whole op transferred nothing. (Positioned I/O only happens on
+                // regular files, which never block, so the read_at fallback is
+                // always ready.)
+                let r = if is_read {
+                    if self.offset != u64::MAX {
+                        file.read_at(buf, self.offset).or_else(|_| file.try_read(buf))
+                    } else {
+                        file.try_read(buf)
+                    }
+                } else if self.offset != u64::MAX {
+                    file.write_at(buf, self.offset).or_else(|_| file.try_write(buf))
                 } else {
-                    file.read(buf)
+                    file.try_write(buf)
+                };
+                if self.offset != u64::MAX {
+                    if let Ok(n) = &r {
+                        self.offset += *n as u64;
+                    }
+                }
+                match r {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        self.total = self.total.wrapping_add(n as i32);
+                        self.buf_offset = i + 1;
+                        i += 1;
+                    }
+                    Err(_) => {
+                        hit_block = true;
+                        self.buf_offset = i; // resume here next poll
+                        break;
+                    }
                 }
             } else {
-                if self.offset != u64::MAX {
-                    file.write_at(buf, self.offset).or_else(|_| file.write(buf))
+                // Async park path: on WouldBlock the driver registers the worker
+                // waker inside poll_read/poll_write and we return Pending.
+                let pr = if is_read {
+                    if self.offset != u64::MAX {
+                        file.poll_read_at(cx, buf, self.offset)
+                    } else {
+                        file.poll_read(cx, buf)
+                    }
+                } else if self.offset != u64::MAX {
+                    file.poll_write_at(cx, buf, self.offset)
                 } else {
-                    file.write(buf)
-                }
-            };
-            // Advance offset for sequential iovec reads at a positioned offset.
-            if self.offset != u64::MAX {
-                if let Ok(n) = &r {
-                    self.offset += *n as u64;
-                }
-            }
-            match r {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    self.total = self.total.wrapping_add(n as i32);
-                    self.buf_offset = i + 1;
-                    i += 1;
-                }
-                Err(_) => {
-                    hit_err = true;
-                    self.buf_offset = i; // resume here next poll
-                    break;
+                    file.poll_write(cx, buf)
+                };
+                match pr {
+                    Poll::Ready(Ok(0)) => break, // EOF
+                    Poll::Ready(Ok(n)) => {
+                        if self.offset != u64::MAX {
+                            self.offset += n as u64;
+                        }
+                        self.total = self.total.wrapping_add(n as i32);
+                        self.buf_offset = i + 1;
+                        i += 1;
+                    }
+                    Poll::Ready(Err(_)) => {
+                        hit_block = true;
+                        self.buf_offset = i; // resume here next poll
+                        break;
+                    }
+                    Poll::Pending => {
+                        // Re-armed by the driver. Resume from this iovec next poll.
+                        self.buf_offset = i;
+                        return Poll::Pending;
+                    }
                 }
             }
         }
-        if !was_nonblock {
-            let _ = file.set_nonblocking(false);
-        }
-        if hit_err {
+
+        if hit_block {
             if self.total == 0 && dontwait {
-                Poll::Ready(-11) // EAGAIN, nothing read, caller asked DONTWAIT
+                Poll::Ready(-11) // EAGAIN: nothing transferred, caller asked DONTWAIT
             } else {
-                // Re-arm: more data may arrive. Resume from buf_offset next poll.
+                // More data may arrive (WouldBlock) or a transient error; re-arm.
                 file.register(cx, events);
                 Poll::Pending
             }
@@ -605,6 +642,56 @@ impl IoRing {
             if iov.len > 0 {
                 table[i] = Some(PinnedUserBuf::resolve(iov.base, iov.len)?);
             }
+        }
+        Ok(())
+    }
+
+    /// `IORING_UNREGISTER_BUFFERS`: drop every registered buffer. Required by
+    /// liburing's `unregister_buffers()` — the tokio-rs `test_register_buffers`
+    /// calls it as a cleanup step, and the whole test fails with ENOSYS if it
+    /// is missing.
+    pub(crate) fn unregister_buffers(&self) -> AxResult<()> {
+        self.registered_bufs.lock().clear();
+        Ok(())
+    }
+
+    /// `IORING_REGISTER_BUFFERS_UPDATE`: replace a contiguous range of the
+    /// registered-buffer table starting at `offset`. `arg` points to an
+    /// `io_uring_rsrc_update2 { offset, _resv, data, tags, nr, _resv2 }`
+    /// (32 bytes), where `data` is an iovec array and `nr` is its length.
+    /// Sparse slots (`len == 0`) clear the table entry. The table auto-grows
+    /// with `None` to cover `offset + nr`.
+    pub(crate) fn register_buffers_update(&self, arg: usize, _nr_args: u32) -> AxResult<()> {
+        #[repr(C)]
+        struct IoUringRsrcUpdate2 {
+            offset: u32,
+            _resv: u32,
+            data: u64, // -> iovec array
+            _tags: u64,
+            nr: u32,
+            _resv2: u32,
+        }
+        #[repr(C)]
+        struct IoVec {
+            base: usize,
+            len: usize,
+        }
+        let upd: crate::mm::UserConstPtr<IoUringRsrcUpdate2> = arg.into();
+        let u = upd.get_as_ref()?;
+        let off = u.offset as usize;
+        let n = u.nr as usize;
+        let mut table = self.registered_bufs.lock();
+        if off + n > table.len() {
+            table.resize_with(off + n, || None);
+        }
+        for i in 0..n {
+            let iov_ptr: crate::mm::UserConstPtr<IoVec> = ((u.data as usize) + i * 16).into();
+            let iov = iov_ptr.get_as_ref()?;
+            table[off + i] = if iov.len > 0 {
+                Some(PinnedUserBuf::resolve(iov.base, iov.len)?)
+            } else {
+                None
+            };
         }
         Ok(())
     }

@@ -89,19 +89,38 @@ pub fn sys_io_uring_enter(
 /// `io_uring_register(fd, opcode, arg, nr_args)`.
 pub fn sys_io_uring_register(fd: i32, opcode: u32, arg: usize, nr_args: u32) -> AxResult<isize> {
     debug!("sys_io_uring_register <= opcode: {opcode}, nr_args: {nr_args}");
-    // IORING_REGISTER_BUFFERS = 0 in the io_uring_register_op enum.
-    if opcode == 0 {
-        // IORING_REGISTER_BUFFERS
-        let ring = IoRing::from_fd(fd)?;
-        ring.register_buffers(arg, nr_args)?;
-        Ok(0)
-    } else if opcode == 8 {
-        // IORING_REGISTER_PROBE — report supported opcodes so liburing consumers
-        // (tokio-rs io-uring-test) run their opcode tests instead of skipping.
-        let ring = IoRing::from_fd(fd)?;
-        ring.register_probe(arg, nr_args)?;
-        Ok(0)
-    } else {
-        Err(AxError::Unsupported)
+    // Constants from io_uring_register_op (we don't link the enum to avoid the
+    // sparse/optional variants tripping the build).
+    const IORING_REGISTER_BUFFERS: u32 = 0;
+    const IORING_UNREGISTER_BUFFERS: u32 = 1;
+    const IORING_REGISTER_PROBE: u32 = 8;
+    const IORING_REGISTER_BUFFERS_UPDATE: u32 = 16;
+    match opcode {
+        IORING_REGISTER_BUFFERS => {
+            let ring = IoRing::from_fd(fd)?;
+            ring.register_buffers(arg, nr_args)?;
+            Ok(0)
+        }
+        IORING_UNREGISTER_BUFFERS => {
+            // liburing's `unregister_buffers()` — required cleanup for
+            // test_register_buffers (returns ENOSYS otherwise).
+            let ring = IoRing::from_fd(fd)?;
+            ring.unregister_buffers()?;
+            Ok(0)
+        }
+        IORING_REGISTER_PROBE => {
+            // Report supported opcodes so liburing consumers (tokio-rs
+            // io-uring-test) run their opcode tests instead of skipping.
+            let ring = IoRing::from_fd(fd)?;
+            ring.register_probe(arg, nr_args)?;
+            Ok(0)
+        }
+        IORING_REGISTER_BUFFERS_UPDATE => {
+            // Replace a range of the registered-buffer table (rsrc_update2).
+            let ring = IoRing::from_fd(fd)?;
+            ring.register_buffers_update(arg, nr_args)?;
+            Ok(0)
+        }
+        _ => Err(AxError::Unsupported),
     }
 }

@@ -8,13 +8,13 @@ mod pipe;
 pub mod signalfd;
 
 use alloc::{borrow::Cow, sync::Arc};
-use core::{ffi::c_int, time::Duration};
+use core::{ffi::c_int, task::{Context, Poll}, time::Duration};
 
 use axerrno::{AxError, AxResult};
 use axfs::{FS_CONTEXT, OpenOptions};
 use axfs_ng_vfs::DeviceId;
 use axio::prelude::*;
-use axpoll::Pollable;
+use axpoll::{IoEvents, Pollable};
 use axtask::current;
 use downcast_rs::{DowncastSync, impl_downcast};
 use flatten_objects::FlattenObjects;
@@ -172,6 +172,120 @@ pub trait FileLike: Pollable + DowncastSync {
     /// Positioned write (pwrite) at `offset`. Default: unsupported.
     fn write_at(&self, _src: &mut IoSrc, _offset: u64) -> AxResult<usize> {
         Err(AxError::Unsupported)
+    }
+
+    /// Non-blocking poll-based read — the async I/O contract for io_uring's
+    /// multiplexing worker. Returns `Poll::Ready(Ok(n))` when bytes were read,
+    /// `Poll::Pending` after registering `cx` for `IN` readiness (the caller's
+    /// waker is woken when more data arrives), or `Poll::Ready(Err(_))` on a
+    /// real error.
+    ///
+    /// Default impl bridges from the blocking `read()` via the `set_nonblocking`
+    /// toggle hack — this works for any driver whose `read` honors the flag, but
+    /// is the hack we are migrating off. Drivers SHOULD override with a direct
+    /// poll-based implementation (no toggle, no implicit blocking).
+    fn poll_read(&self, cx: &mut Context<'_>, buf: &mut IoDst) -> Poll<AxResult<usize>> {
+        if !self.poll().intersects(IoEvents::IN) {
+            self.register(cx, IoEvents::IN);
+            return Poll::Pending;
+        }
+        let was_nb = self.nonblocking();
+        if !was_nb {
+            let _ = self.set_nonblocking(true);
+        }
+        let r = self.read(buf);
+        if !was_nb {
+            let _ = self.set_nonblocking(false);
+        }
+        match r {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(AxError::WouldBlock) => {
+                self.register(cx, IoEvents::IN);
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Non-blocking poll-based write — see `poll_read`. Default impl bridges from
+    /// `write()` via the `set_nonblocking` toggle hack.
+    fn poll_write(&self, cx: &mut Context<'_>, buf: &mut IoSrc) -> Poll<AxResult<usize>> {
+        if !self.poll().intersects(IoEvents::OUT) {
+            self.register(cx, IoEvents::OUT);
+            return Poll::Pending;
+        }
+        let was_nb = self.nonblocking();
+        if !was_nb {
+            let _ = self.set_nonblocking(true);
+        }
+        let r = self.write(buf);
+        if !was_nb {
+            let _ = self.set_nonblocking(false);
+        }
+        match r {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(AxError::WouldBlock) => {
+                self.register(cx, IoEvents::OUT);
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Non-blocking poll-based positioned read (`pread`). Regular files are
+    /// always ready, so they override this to call `read_at` directly. The
+    /// default falls back to `poll_read` (ignoring `offset`) — pipes/sockets
+    /// don't support positioned I/O, which is the right behavior.
+    fn poll_read_at(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut IoDst,
+        _offset: u64,
+    ) -> Poll<AxResult<usize>> {
+        self.poll_read(cx, buf)
+    }
+
+    /// Non-blocking poll-based positioned write (`pwrite`). See `poll_read_at`.
+    fn poll_write_at(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut IoSrc,
+        _offset: u64,
+    ) -> Poll<AxResult<usize>> {
+        self.poll_write(cx, buf)
+    }
+
+    /// Single non-blocking read attempt — never registers a waker, never parks.
+    /// Returns `Ok(n)`/`Ok(0)` (EOF) on success, or `Err(WouldBlock)` when
+    /// nothing is available right now. This is the contract for io_uring's
+    /// `MSG_DONTWAIT` path, which must report `-EAGAIN` rather than wait.
+    ///
+    /// Default impl bridges from `read()` via the `set_nonblocking` toggle.
+    /// Drivers with an inherently non-blocking read (pipes) override this to
+    /// skip the toggle entirely.
+    fn try_read(&self, buf: &mut IoDst) -> AxResult<usize> {
+        let was_nb = self.nonblocking();
+        if !was_nb {
+            let _ = self.set_nonblocking(true);
+        }
+        let r = self.read(buf);
+        if !was_nb {
+            let _ = self.set_nonblocking(false);
+        }
+        r
+    }
+
+    /// Single non-blocking write attempt — see `try_read`.
+    fn try_write(&self, buf: &mut IoSrc) -> AxResult<usize> {
+        let was_nb = self.nonblocking();
+        if !was_nb {
+            let _ = self.set_nonblocking(true);
+        }
+        let r = self.write(buf);
+        if !was_nb {
+            let _ = self.set_nonblocking(false);
+        }
+        r
     }
 
     fn from_fd(fd: c_int) -> AxResult<Arc<Self>>

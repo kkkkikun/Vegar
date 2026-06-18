@@ -182,14 +182,58 @@ Socket（`kernel/src/file/net.rs`）已 impl `FileLike`（read=recv, write=send�
 | `test_tcp_send_recv` | ✅ PASS | TCP Send/Recv |
 | `test_tcp_accept` | ✅ PASS | TCP Accept |
 | `test_pipe` | ⏭ skip | std::io::pipe gate 未满足 |
-| `test_tcp_writev_readv` | ❌ FAIL | Writev=80 ✓ 但 **Readv=44** |
-| `test_register_buffers` | ❌ FAIL | READ_FIXED=0（期望 4096） |
-| `test_file_write_read` | ❌ FAIL | Write=44 ✓ 但 **Read=0** |
+| `test_tcp_writev_readv` | ✅ PASS | **#32 修复**——READV 跨 poll 恢复，EAGAIN 时 re-arm 而非返回部分结果 |
+| `test_register_buffers` | ✅ PASS | READ_FIXED 正常 (#33)，补 `UNREGISTER_BUFFERS`(op1) + `REGISTER_BUFFERS_UPDATE`(op16) 后通过 |
+| `test_file_write_read` | ✅ PASS | **#33 修复**——`FileLike::read_at/write_at` + `sqe.off` 生效，pread/pwrite 语义 |
 
-**两个已定位的真 bug（待修）**：
-1. **READV 分块过读**：worker 逐 iovec 调 `file.read`（每次一个 recv）。当一次 recv 的可用数据 > 当前 iovec 容量时，`PinnedUserBuf::copy_in` 按 iovec 容量截断，**多余字节被丢弃**（readv 80B 数据，第一个 44B iovec 收 44，丢 36）。单缓冲（write_read）不触发。修法：READV 应一次读满所有 iovec，或让 recv 读量 ≤ 当前 iovec `remaining_mut`。
-2. **文件 `sqe.off` 未生效**：READ/WRITE/READ_FIXED/WRITE_FIXED 忽略 `sqe.off`，用 fd 当前位置。文件 Write 推进 fd 位置后，Read 读到 EOF（`test_file_write_read`）或错位（`test_register_buffers`）。修法：按 `sqe.off` 做 pread/pwrite（off=-1 时用当前位置）。管道/socket 不受影响（stream，忽略 off），故 `test_tcp_*` 全过。
+**已修 bug（#32 +#33）**：
+1. **READV 多 iovec 分块过读 (✅ #32)**：worker 逐 iovec 调 `file.read`，第二 iovec 因 smoltcp 时序见 EAGAIN，旧代码返回部分结果（44/80）。修复：`OpFuture` 加 `total`+`buf_offset` 跨 poll 跟踪进度——EAGAIN 时 **re-arm + Pending**，下次 poll 从断点 iovec 恢复，最终读满全部 80 字节。`test_tcp_writev_readv: PASS`。
+2. **文件 `sqe.off` 未生效 (✅ #33)**：READ/WRITE 忽略 `sqe.off`，用 fd 当前位置，Write 推进位置后 Read 撞 EOF。修复：`FileLike` 新增 `read_at`/`write_at`（定位读写），`File` 委托 `axfs_ng::File::read_at/write_at`（`&self`，不需 &mut），poll_rw 在 `offset != u64::MAX` 时用定位 I/O、否则回退普通读写（管道/socket 不受影响）。`test_file_write_read: PASS`。
+- **`test_register_buffers`**：READ_FIXED 的 offset 已正常，但该测试额外调用了 `IORING_REGISTER_BUFFERS_UPDATE`(opcode 16) 等 register 操作码，返回 ENOSYS——这是独立新增量，非 bug。
 
 > 持久容器 `iouring-dev`（`--privileged --network host`，仓库挂 `/workspace`）做交叉编译；构建命令在容器内 `/tmp/iouring`（避开仓库 vendor 配置）：`cargo +nightly-2026-02-25 build --features ci --target riscv64gc-unknown-linux-musl --release -p io-uring-test`（`RUSTFLAGS=-C target-feature=+crt-static`，linker=`riscv64-linux-musl-gcc`）。
 
 
+
+---
+
+## Stage 2：AsyncFileLike trait 重构 + REGISTER_BUFFERS_UPDATE — ✅ 9/10 通过
+
+### 动机：消除 `set_nonblocking` hack（命中竞赛 ③ 通用性）
+
+`OpFuture::poll_rw` 的旧核心模式：就绪检查 → `set_nonblocking(true)` → 调阻塞接口 `FileLike::read/write` → `set_nonblocking(false)` → WouldBlock 时 register+Pending。这把**阻塞语义**接口强行扭成异步，每个驱动要接入 io_uring 都得遵守"你的 read 在 nonblocking 模式下返 WouldBlock"这个隐式契约——不是显式 trait 约束。这正是 `#32`（READV 分块 EAGAIN）的深层原因。对齐 Redox AsyncScheme / RFC 0002 的设计哲学：驱动**直接暴露 poll-based I/O**。
+
+### 设计：把异步 I/O 契约提升到 `FileLike` trait
+
+不另建 trait，而在 `FileLike`（`kernel/src/file/mod.rs`）上加 6 个方法，默认 impl 用旧 toggle 模式（不 override 的驱动零行为变更）：
+
+- `poll_read(cx, buf) -> Poll<Result>` / `poll_write` —— 异步读写的 park 路径（WouldBlock → register+Pending）
+- `poll_read_at(cx, buf, off)` / `poll_write_at` —— 定位 I/O 的 async 变体（文件恒就绪）
+- `try_read(buf)` / `try_write(buf)` —— 单次非阻塞尝试，**不注册 waker**（`MSG_DONTWAIT` 路径，返回 WouldBlock 而非 park）
+
+各驱动 override（异步策略内聚到驱动自身）：
+- **File**（`fs.rs`）：恒就绪，`poll_read = Ready(self.read(buf))`，无 toggle。
+- **Pipe**（`pipe.rs`）：抽出 `consume_once`/`produce_once`（单次非阻塞 ring buffer 操作），`poll_read` 直接调 + register+Pending；跳过旧 `block_on(poll_io(...))` 嵌套。**注意**：worker 不是用户任务，broken pipe 不 raise SIGPIPE（会发错进程），改走 CQE 返回 `-EPIPE`。
+- **Socket**：用默认 impl（smoltcp 阻塞 socket 仍需 toggle set_nonblocking，不可避免；但 toggle 现在内聚到 Socket 的 poll 路径，不再散落在 poll_rw）。
+
+### `poll_rw` 简化（`kernel/src/file/io_uring/mod.rs`）
+
+重写为**完全通过 trait 驱动 I/O**：park 路径调 `file.poll_read/poll_write`（定位时 `poll_read_at/poll_write_at`），DONTWAIT 路径调 `file.try_read/try_write`。**`poll_rw` 自身零 `set_nonblocking` 调用**——架构目标达成。跨 poll 恢复（`total`/`buf_offset`）、DONTWAIT(-11)、offset 推进、EOF 语义全部保留。
+
+### REGISTER_BUFFERS_UPDATE（顺手补 → 9/10）
+
+`sys_io_uring_register` 原只支持 opcode 0/8。`test_register_buffers` 末尾调 `unregister_buffers()`(opcode 1) 返回 ENOSYS → 整个测试失败。补：
+- `unregister_buffers()`(opcode 1)：清空 `registered_bufs` 表。
+- `register_buffers_update()`(opcode 16)：解析 `io_uring_rsrc_update2`，替换 `registered_bufs[offset..offset+nr]`，稀疏 slot（len==0）清空，表自动扩展。
+
+### 结果（QEMU `-smp 1`）
+
+**9/10 上游 io-uring-test PASS**（test_pipe 仍 feature-gated skip，非失败）：
+`test_nop / test_batch / test_queue_split / test_tcp_write_read / test_tcp_writev_readv / test_tcp_send_recv / test_tcp_accept / test_register_buffers / test_file_write_read` 全过。**13/13 自测全过**（含 24 客户端并发 echo）。
+
+**渐进式 6 阶段验证**（每阶段 Docker `iouring-dev` 构建后回归）：
+1. trait 加方法（默认 impl，零行为变更）→ 2. File override → 3. Pipe override → 4. Socket（用默认）→ 5. poll_rw 切换（8/10 不变，证明行为保持）→ 6. REGISTER_BUFFERS_UPDATE（→ 9/10）。
+
+### 架构意义
+
+io_uring worker 现在对**所有驱动类型**（文件/管道/socket）说同一种 async trait 语言。新驱动只需 impl `FileLike` 的 `poll_read`/`poll_write` 即可被多路复用，零修改接入——这正是竞赛 ③「通用性 / 驱动跨 OS 复用」的核心论据。`set_nonblocking` toggle 从"worker 的隐式假设"变为"驱动自己的实现细节"。

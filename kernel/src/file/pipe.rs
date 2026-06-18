@@ -2,7 +2,7 @@ use alloc::{borrow::Cow, format, sync::Arc};
 use core::{
     mem,
     sync::atomic::{AtomicBool, Ordering},
-    task::Context,
+    task::{Context, Poll},
 };
 
 use axerrno::{AxError, AxResult};
@@ -100,6 +100,54 @@ impl Pipe {
         buffer.push_slice(right);
         Ok(())
     }
+
+    /// Single non-blocking consume from the ring buffer into `dst`.
+    /// Returns bytes read, `Ok(0)` on EOF (all writers closed), or `WouldBlock`
+    /// when empty. Shared by the blocking `read` (via `poll_io`) and the async
+    /// `poll_read`.
+    fn consume_once(&self, dst: &mut IoDst) -> AxResult<usize> {
+        let read = {
+            let cons = self.shared.buffer.lock();
+            let (left, right) = cons.as_slices();
+            let mut count = dst.write(left)?;
+            if count >= left.len() {
+                count += dst.write(right)?;
+            }
+            unsafe { cons.advance_read_index(count) };
+            count
+        };
+        if read > 0 {
+            self.shared.poll_tx.wake();
+            Ok(read)
+        } else if self.closed() {
+            Ok(0)
+        } else {
+            Err(AxError::WouldBlock)
+        }
+    }
+
+    /// Single non-blocking produce from `src` into the ring buffer.
+    /// Returns bytes written, or `WouldBlock` when full. Does NOT raise SIGPIPE
+    /// — callers that need it (the blocking `write`, in the user task context)
+    /// do so themselves on `BrokenPipe`.
+    fn produce_once(&self, src: &mut IoSrc) -> AxResult<usize> {
+        let written = {
+            let mut prod = self.shared.buffer.lock();
+            let (left, right) = prod.vacant_slices_mut();
+            let mut count = src.read(unsafe { left.assume_init_mut() })?;
+            if count >= left.len() {
+                count += src.read(unsafe { right.assume_init_mut() })?;
+            }
+            unsafe { prod.advance_write_index(count) };
+            count
+        };
+        if written > 0 {
+            self.shared.poll_rx.wake();
+            Ok(written)
+        } else {
+            Err(AxError::WouldBlock)
+        }
+    }
 }
 
 fn raise_pipe() {
@@ -121,24 +169,7 @@ impl FileLike for Pipe {
         }
 
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
-            let read = {
-                let cons = self.shared.buffer.lock();
-                let (left, right) = cons.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                count
-            };
-            if read > 0 {
-                self.shared.poll_tx.wake();
-                Ok(read)
-            } else if self.closed() {
-                Ok(0)
-            } else {
-                Err(AxError::WouldBlock)
-            }
+            self.consume_once(dst)
         }))
     }
 
@@ -198,6 +229,87 @@ impl FileLike for Pipe {
 
     fn nonblocking(&self) -> bool {
         self.non_blocking.load(Ordering::Acquire)
+    }
+
+    /// io_uring async read path: consume from the ring buffer in a single
+    /// non-blocking attempt, and register the worker's waker on `WouldBlock`
+    /// (then re-check once to close the lost-wakeup race). This skips the
+    /// `block_on(poll_io(...))` nesting the blocking `read` uses — the worker
+    /// drives poll-readiness directly. SIGPIPE/EPIPE handling stays in `write`
+    /// (the sys_* path); here a broken pipe surfaces as a CQE result.
+    fn poll_read(&self, cx: &mut Context<'_>, dst: &mut IoDst) -> Poll<AxResult<usize>> {
+        if !self.is_read() {
+            return Poll::Ready(Err(AxError::BadFileDescriptor));
+        }
+        if dst.is_full() {
+            return Poll::Ready(Ok(0));
+        }
+        match self.consume_once(dst) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(AxError::WouldBlock) => {
+                self.register(cx, IoEvents::IN);
+                match self.consume_once(dst) {
+                    Ok(n) => Poll::Ready(Ok(n)),
+                    Err(AxError::WouldBlock) => Poll::Pending,
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    /// io_uring async write path: produce into the ring buffer in a single
+    /// non-blocking attempt; register on full. A closed pipe returns
+    /// `BrokenPipe` for the CQE (io_uring does not raise SIGPIPE — the worker
+    /// is not the submitter task).
+    fn poll_write(&self, cx: &mut Context<'_>, src: &mut IoSrc) -> Poll<AxResult<usize>> {
+        if !self.is_write() {
+            return Poll::Ready(Err(AxError::BadFileDescriptor));
+        }
+        if src.remaining() == 0 {
+            return Poll::Ready(Ok(0));
+        }
+        if self.closed() {
+            return Poll::Ready(Err(AxError::BrokenPipe));
+        }
+        match self.produce_once(src) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(AxError::WouldBlock) => {
+                self.register(cx, IoEvents::OUT);
+                match self.produce_once(src) {
+                    Ok(n) => Poll::Ready(Ok(n)),
+                    Err(AxError::WouldBlock) => Poll::Pending,
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    /// Single non-blocking consume — the pipe's ring buffer is already
+    /// non-blocking, so `try_read` is just `consume_once` (no toggle).
+    fn try_read(&self, dst: &mut IoDst) -> AxResult<usize> {
+        if !self.is_read() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if dst.is_full() {
+            return Ok(0);
+        }
+        self.consume_once(dst)
+    }
+
+    /// Single non-blocking produce (no SIGPIPE — io_uring reports -EPIPE via CQE).
+    fn try_write(&self, src: &mut IoSrc) -> AxResult<usize> {
+        if !self.is_write() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if src.remaining() == 0 {
+            return Ok(0);
+        }
+        if self.closed() {
+            return Err(AxError::BrokenPipe);
+        }
+        self.produce_once(src)
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {

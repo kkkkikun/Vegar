@@ -3,7 +3,7 @@ use core::{
     ffi::c_int,
     hint::likely,
     sync::atomic::{AtomicBool, Ordering},
-    task::Context,
+    task::{Context, Poll},
 };
 
 use axerrno::{AxError, AxResult};
@@ -174,6 +174,46 @@ impl FileLike for File {
 
     fn path(&self) -> Cow<'_, str> {
         path_for(self.inner.location())
+    }
+
+    // Regular files & backing devices are always ready: no readiness wait and
+    // no set_nonblocking toggle. The poll contract for io_uring is satisfied by
+    // the synchronous read/write directly. (File::read already fast-paths the
+    // blocking case to inner.read with no poll_io machinery for disk files.)
+    fn poll_read(&self, _cx: &mut Context<'_>, buf: &mut IoDst) -> Poll<AxResult<usize>> {
+        Poll::Ready(self.read(buf))
+    }
+
+    fn poll_write(&self, _cx: &mut Context<'_>, buf: &mut IoSrc) -> Poll<AxResult<usize>> {
+        Poll::Ready(self.write(buf))
+    }
+
+    fn poll_read_at(
+        &self,
+        _cx: &mut Context<'_>,
+        buf: &mut IoDst,
+        offset: u64,
+    ) -> Poll<AxResult<usize>> {
+        Poll::Ready(self.read_at(buf, offset))
+    }
+
+    fn poll_write_at(
+        &self,
+        _cx: &mut Context<'_>,
+        buf: &mut IoSrc,
+        offset: u64,
+    ) -> Poll<AxResult<usize>> {
+        Poll::Ready(self.write_at(buf, offset))
+    }
+
+    // Regular files never block, so a single attempt is just the synchronous
+    // read/write — no nonblocking toggle.
+    fn try_read(&self, buf: &mut IoDst) -> AxResult<usize> {
+        self.read(buf)
+    }
+
+    fn try_write(&self, buf: &mut IoSrc) -> AxResult<usize> {
+        self.write(buf)
     }
 
     fn from_fd(fd: c_int) -> AxResult<Arc<Self>>
