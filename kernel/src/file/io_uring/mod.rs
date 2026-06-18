@@ -214,6 +214,8 @@ struct Op {
     poll_events: u32,
     /// `msg_flags` for SEND/RECV (e.g. MSG_DONTWAIT). 0 otherwise.
     msg_flags: u32,
+    /// File offset for READ/WRITE (sqe.off). u64::MAX means "use current position".
+    offset: u64,
     /// This op's CQ ring view + the pages that back it (keepalive: the pages
     /// stay pinned until the CQE is posted, even if the fd is already closed).
     cq: CqRing,
@@ -239,10 +241,15 @@ struct OpFuture {
     buf: Option<Vec<PinnedUserBuf>>,
     poll_events: u32,
     msg_flags: u32,
+    offset: u64,
     cq: CqRing,
     cq_pages: Arc<SharedPages>,
     cq_wq: Arc<WaitQueue>,
     overflow: Arc<Mutex<VecDeque<(u64, i32)>>>,
+    /// Cumulative bytes across re-polls for READ/WRITE (resumes after EAGAIN).
+    total: i32,
+    /// Which iovec to resume from on the next poll (after EAGAIN mid-readv).
+    buf_offset: usize,
 }
 
 impl From<Op> for OpFuture {
@@ -254,6 +261,7 @@ impl From<Op> for OpFuture {
             buf,
             poll_events,
             msg_flags,
+            offset,
             cq,
             cq_pages,
             cq_wq,
@@ -266,10 +274,13 @@ impl From<Op> for OpFuture {
             buf,
             poll_events,
             msg_flags,
+            offset,
             cq,
             cq_pages,
             cq_wq,
             overflow,
+            total: 0,
+            buf_offset: 0,
         }
     }
 }
@@ -296,11 +307,12 @@ impl OpFuture {
         )
     }
 
-    /// Readiness-wait + nonblocking read/write. Poll semantics: `Pending`
-    /// (registers the worker waker) until the fd is readable/writable; then one
-    /// nonblocking pass over the iovec segments. A spurious EAGAIN (readiness
-    /// reported but I/O still blocked — rare race) re-arms and returns
-    /// `Pending` so a blocking op is never falsely reported as -EAGAIN.
+    /// Readiness-wait + nonblocking read/write with **cross-poll resume**: if
+    /// EAGAIN occurs mid-way through a multi-iovec op (e.g. READV where the
+    /// second iovec's recv blocks after the first succeeded), the op saves its
+    /// progress (`self.total`, `self.buf_offset`) and re-arms as Pending. On
+    /// the next poll (woken when more data arrives), it resumes from the
+    /// interrupted iovec — so a readv eventually completes with ALL bytes.
     fn poll_rw(&mut self, cx: &mut Context<'_>, is_read: bool) -> Poll<i32> {
         let file = match self.file.as_ref() {
             Some(f) => f.clone(),
@@ -320,15 +332,46 @@ impl OpFuture {
         if !was_nonblock {
             let _ = file.set_nonblocking(true);
         }
-        let mut total: i32 = 0;
-        let mut err: i32 = 0;
-        for buf in bufs.iter_mut() {
-            let r = if is_read { file.read(buf) } else { file.write(buf) };
+        // Resume from the iovec that last got EAGAIN; earlier iovecs are full
+        // (remaining_mut == 0) and get skipped.
+        let mut hit_err = false;
+        let mut i = self.buf_offset;
+        while i < bufs.len() {
+            let buf = &mut bufs[i];
+            if buf.remaining_mut() == 0 {
+                i += 1;
+                self.buf_offset = i;
+                continue;
+            }
+            let r = if is_read {
+                if self.offset != u64::MAX {
+                    file.read_at(buf, self.offset).or_else(|_| file.read(buf))
+                } else {
+                    file.read(buf)
+                }
+            } else {
+                if self.offset != u64::MAX {
+                    file.write_at(buf, self.offset).or_else(|_| file.write(buf))
+                } else {
+                    file.write(buf)
+                }
+            };
+            // Advance offset for sequential iovec reads at a positioned offset.
+            if self.offset != u64::MAX {
+                if let Ok(n) = &r {
+                    self.offset += *n as u64;
+                }
+            }
             match r {
-                Ok(0) => break,
-                Ok(n) => total = total.wrapping_add(n as i32),
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    self.total = self.total.wrapping_add(n as i32);
+                    self.buf_offset = i + 1;
+                    i += 1;
+                }
                 Err(_) => {
-                    err = -11; // EAGAIN
+                    hit_err = true;
+                    self.buf_offset = i; // resume here next poll
                     break;
                 }
             }
@@ -336,15 +379,17 @@ impl OpFuture {
         if !was_nonblock {
             let _ = file.set_nonblocking(false);
         }
-        if total == 0 && err != 0 {
-            if dontwait {
-                Poll::Ready(err)
+        if hit_err {
+            if self.total == 0 && dontwait {
+                Poll::Ready(-11) // EAGAIN, nothing read, caller asked DONTWAIT
             } else {
+                // Re-arm: more data may arrive. Resume from buf_offset next poll.
                 file.register(cx, events);
                 Poll::Pending
             }
         } else {
-            Poll::Ready(total)
+            // All iovecs processed (or EOF). Return cumulative total.
+            Poll::Ready(self.total)
         }
     }
 }
@@ -769,6 +814,7 @@ impl IoRing {
                 buf,
                 poll_events,
                 msg_flags,
+                offset: unsafe { sqe.__bindgen_anon_1.off },
                 cq: self.cq,
                 cq_pages: self.cq_ring_pages.clone(),
                 cq_wq: self.cq_wq.clone(),

@@ -163,6 +163,17 @@ pub trait FileLike: Pollable + DowncastSync {
         Ok(())
     }
 
+    /// Positioned read (pread) at `offset`. Default: unsupported (pipes, sockets).
+    /// Regular files override this for io_uring READ with sqe.off.
+    fn read_at(&self, _dst: &mut IoDst, _offset: u64) -> AxResult<usize> {
+        Err(AxError::Unsupported)
+    }
+
+    /// Positioned write (pwrite) at `offset`. Default: unsupported.
+    fn write_at(&self, _src: &mut IoSrc, _offset: u64) -> AxResult<usize> {
+        Err(AxError::Unsupported)
+    }
+
     fn from_fd(fd: c_int) -> AxResult<Arc<Self>>
     where
         Self: Sized + 'static,

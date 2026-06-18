@@ -164,6 +164,14 @@ impl FileLike for File {
         self.nonblock.load(Ordering::Acquire)
     }
 
+    fn read_at(&self, dst: &mut IoDst, offset: u64) -> AxResult<usize> {
+        self.inner().read_at(dst, offset)
+    }
+
+    fn write_at(&self, src: &mut IoSrc, offset: u64) -> AxResult<usize> {
+        self.inner().write_at(src, offset)
+    }
+
     fn path(&self) -> Cow<'_, str> {
         path_for(self.inner.location())
     }
