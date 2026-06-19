@@ -43,12 +43,10 @@ int io_uring_queue_init(unsigned entries, struct io_uring *ring, unsigned flags)
     size_t page = 4096;
     char *sq_ring = ring_mmap(fd, page, IORING_OFF_SQ_RING);
     char *cq_ring = ring_mmap(fd, page, IORING_OFF_CQ_RING);
-    char *sqes    = ring_mmap(fd, page, IORING_OFF_SQES);
-    if (!sq_ring || !cq_ring || !sqes) return -1;
+    if (!sq_ring || !cq_ring) return -1;
 
     ring->sq.ring_ptr = sq_ring;
     ring->cq.ring_ptr = cq_ring;
-    ring->sq.sqes = (struct io_uring_sqe *)sqes;
 
     ring->sq.head        = (unsigned *)(sq_ring + p.sq_off.head);
     ring->sq.tail        = (unsigned *)(sq_ring + p.sq_off.tail);
@@ -57,6 +55,17 @@ int io_uring_queue_init(unsigned entries, struct io_uring *ring, unsigned flags)
     ring->sq.flags       = (unsigned *)(sq_ring + p.sq_off.flags);
     ring->sq.dropped     = (unsigned *)(sq_ring + p.sq_off.dropped);
     ring->sq.array       = (unsigned *)(sq_ring + p.sq_off.array);
+
+    /* The SQE array is sized by the KERNEL's actual (power-of-two) entries, not
+     * our request — mmap that many bytes (rounded to a page). The kernel rounds
+     * entries up to a power of two, so a 1-page mmap (64 SQEs) overflows for any
+     * larger ring and get_sqe writes past the mapping → SIGSEGV. */
+    unsigned kentries = *ring->sq.ring_entries;
+    size_t sqes_sz = ((size_t)kentries * 64 + page - 1) & ~(page - 1);
+    if (sqes_sz < page) sqes_sz = page;
+    char *sqes = ring_mmap(fd, sqes_sz, IORING_OFF_SQES);
+    if (!sqes) return -1;
+    ring->sq.sqes = (struct io_uring_sqe *)sqes;
 
     ring->cq.head        = (unsigned *)(cq_ring + p.cq_off.head);
     ring->cq.tail        = (unsigned *)(cq_ring + p.cq_off.tail);
@@ -71,9 +80,15 @@ int io_uring_queue_init(unsigned entries, struct io_uring *ring, unsigned flags)
 
 void io_uring_queue_exit(struct io_uring *ring) {
     size_t page = 4096;
+    /* Read kentries BEFORE munmapping sq_ring — ring_entries points INTO it. */
+    unsigned kentries = ring->sq.ring_entries ? *ring->sq.ring_entries : 0;
     if (ring->sq.ring_ptr) munmap(ring->sq.ring_ptr, page);
     if (ring->cq.ring_ptr) munmap(ring->cq.ring_ptr, page);
-    if (ring->sq.sqes)     munmap(ring->sq.sqes, page);
+    if (ring->sq.sqes) {
+        size_t sqes_sz = ((size_t)kentries * 64 + page - 1) & ~(page - 1);
+        if (sqes_sz < page) sqes_sz = page;
+        munmap(ring->sq.sqes, sqes_sz);
+    }
     close(ring->ring_fd);
     memset(ring, 0, sizeof *ring);
 }

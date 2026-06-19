@@ -93,6 +93,28 @@ run_iouring io_uring_iodepth
 run_iouring io_uring_echo
 
 # =========================================================================
+# Head-to-head benchmark: io_uring (1 worker, O(1) mem) vs thread-per-conn
+# (K handlers, O(K) mem). Same clients/payload/network; only the server model
+# differs. Prints PEAK mem+tasks (monitor) and RESULT throughput per (mode,K).
+# Sweep K to show the O(1)-vs-O(K) memory curve + concurrent throughput.
+# =========================================================================
+run_bench() {
+    mode="$1"; k="$2"; m="$3"
+    if [ -x "/io_uring_vs_thread" ]; then
+        /io_uring_vs_thread "$mode" "$k" "$m" 2>&1 | /musl/busybox grep -E "PEAK|RESULT"
+    else
+        echo "===== [bench] /io_uring_vs_thread NOT FOUND ====="
+    fi
+}
+for k in 8 32 64; do
+    echo "===== [bench] K=$k M=1024 ====="
+    run_bench iouring "$k" 1024
+    run_bench thread  "$k" 1024
+    /musl/busybox sleep 1
+done
+
+
+# =========================================================================
 # tokio-rs io-uring-test: the REAL upstream suite (statically cross-compiled).
 # Run supported-opcode tests individually by name — the target arg makes
 # require! run only that test (avoids hangs on SQPOLL/TIMEOUT/CANCEL, which we
