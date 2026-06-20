@@ -30,9 +30,15 @@ pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<io_uring_params>) ->
         // resource-released CQE (user_data = old tag) when a tagged registered
         // buffer is replaced via REGISTER_BUFFERS_UPDATE. Required for
         // test_register_buffers_update to run.
+        // IORING_FEAT_FAST_POLL(1<<5): StarryOS I/O is inherently polling-based
+        // (smoltcp + global_worker poll loop). There is no interrupt→wakeup
+        // latency to "bypass", so FAST_POLL is the natural mode of operation.
         const IORING_FEAT_RSRC_TAGS: u32 = 1024;
+        const IORING_FEAT_FAST_POLL: u32 = 1 << 5;
         params.features =
-            linux_raw_sys::io_uring::IORING_FEAT_NODROP | IORING_FEAT_RSRC_TAGS;
+            linux_raw_sys::io_uring::IORING_FEAT_NODROP
+            | IORING_FEAT_RSRC_TAGS
+            | IORING_FEAT_FAST_POLL;
         params.wq_fd = 0;
         IoRing::fill_offsets(&mut params.sq_off, &mut params.cq_off);
     }
@@ -100,9 +106,11 @@ pub fn sys_io_uring_register(fd: i32, opcode: u32, arg: usize, nr_args: u32) -> 
     // sparse/optional variants tripping the build).
     const IORING_REGISTER_BUFFERS: u32 = 0;
     const IORING_UNREGISTER_BUFFERS: u32 = 1;
-    const IORING_REGISTER_BUFFERS2: u32 = 15;
+    const IORING_REGISTER_FILES: u32 = 2;
     const IORING_REGISTER_PROBE: u32 = 8;
+    const IORING_REGISTER_BUFFERS2: u32 = 15;
     const IORING_REGISTER_BUFFERS_UPDATE: u32 = 16;
+    const IORING_REGISTER_FILES_UPDATE: u32 = 18;
     match opcode {
         IORING_REGISTER_BUFFERS => {
             let ring = IoRing::from_fd(fd)?;
@@ -135,6 +143,16 @@ pub fn sys_io_uring_register(fd: i32, opcode: u32, arg: usize, nr_args: u32) -> 
             // posts a tag CQE when a tagged slot is replaced.
             let ring = IoRing::from_fd(fd)?;
             ring.register_buffers_update(arg, nr_args)?;
+            Ok(0)
+        }
+        IORING_REGISTER_FILES => {
+            let ring = IoRing::from_fd(fd)?;
+            ring.register_files(arg, nr_args)?;
+            Ok(0)
+        }
+        IORING_REGISTER_FILES_UPDATE => {
+            let ring = IoRing::from_fd(fd)?;
+            ring.register_files_update(arg, nr_args)?;
             Ok(0)
         }
         _ => Err(AxError::Unsupported),

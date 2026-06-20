@@ -13,11 +13,13 @@
 
 pub mod syscall;
 
-use alloc::{borrow::Cow, boxed::Box, collections::VecDeque, format, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::Cow, boxed::Box, collections::VecDeque, format, sync::Arc, task::Wake, vec::Vec,
+};
 use core::{
     future::{poll_fn, Future},
     pin::Pin,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -28,6 +30,7 @@ use axio::{IoBuf, IoBufMut, Read, Write};
 use axnet::SocketOps;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
+use hashbrown::HashMap;
 use axtask::{
     WaitQueue, current,
     future::{block_on, sleep},
@@ -565,6 +568,7 @@ pub struct IoRing {
     sq: SqRing,
     cq: CqRing,
     registered_bufs: Mutex<Vec<Option<(PinnedUserBuf, u64)>>>,
+    registered_files: Mutex<Vec<Option<Arc<dyn FileLike>>>>,
     /// Waiters blocked in `io_uring_enter(GETEVENTS)` are parked here; the
     /// worker wakes them from `post_cqe` once CQEs appear.
     cq_wq: Arc<WaitQueue>,
@@ -655,6 +659,7 @@ impl IoRing {
             sq,
             cq,
             registered_bufs: Mutex::new(Vec::new()),
+            registered_files: Mutex::new(Vec::new()),
             cq_wq: Arc::new(WaitQueue::new()),
             overflow: Arc::new(Mutex::new(VecDeque::new())),
         })
@@ -803,6 +808,56 @@ impl IoRing {
         Ok(())
     }
 
+    /// `IORING_REGISTER_FILES`: register an array of fds for use with
+    /// `IOSQE_FIXED_FILE`. `arg` points to an array of `int` fds. On StarryOS
+    /// we resolve each to an `Arc<dyn FileLike>` via `get_file_like` at register
+    /// time (the submitter's fd table is live here).
+    pub(crate) fn register_files(&self, arg: usize, nr: u32) -> AxResult<()> {
+        let n = nr as usize;
+        let fds: crate::mm::UserConstPtr<i32> = arg.into();
+        let fd_slice = fds.get_as_slice(n)?;
+        let mut table = self.registered_files.lock();
+        table.resize_with(n, || None);
+        for (i, &fd) in fd_slice.iter().enumerate() {
+            if fd >= 0 {
+                if let Ok(file) = get_file_like(fd) {
+                    table[i] = Some(file);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `IORING_REGISTER_FILES_UPDATE`: update a range of the registered-files
+    /// table starting at `offset`. `arg` points to `io_uring_files_update
+    /// { offset, resv, fds }`, `nr` is the number of entries.
+    pub(crate) fn register_files_update(&self, arg: usize, nr: u32) -> AxResult<()> {
+        #[repr(C)]
+        struct IoUringFilesUpdate {
+            offset: u32,
+            _resv: u32,
+            fds: u64,  // -> int array
+        }
+        let upd: crate::mm::UserConstPtr<IoUringFilesUpdate> = arg.into();
+        let u = upd.get_as_ref()?;
+        let off = u.offset as usize;
+        let n = nr as usize;
+        let fds: crate::mm::UserConstPtr<i32> = (u.fds as usize).into();
+        let fd_slice = fds.get_as_slice(n)?;
+        let mut table = self.registered_files.lock();
+        if off + n > table.len() {
+            table.resize_with(off + n, || None);
+        }
+        for (i, &fd) in fd_slice.iter().enumerate() {
+            table[off + i] = if fd >= 0 {
+                get_file_like(fd).ok()
+            } else {
+                None
+            };
+        }
+        Ok(())
+    }
+
     /// `IORING_REGISTER_PROBE`: fill the user-provided `io_uring_probe` with the
     /// opcodes we support, so a liburing consumer (e.g. tokio-rs `io-uring-test`)
     /// can gate its opcode tests via `probe.is_supported(op)` instead of skipping
@@ -920,14 +975,29 @@ impl IoRing {
         // rather than enqueuing them for the worker. Non-ACCEPT ops below go to
         // the worker as usual.
         let mut accepts: Vec<(u64, Arc<Socket>)> = Vec::new();
+
+        // Resolve fd: if IOSQE_FIXED_FILE is set, `sqe.fd` is an index into
+        // `registered_files`; otherwise it's a real fd number.
+        fn resolve_fd(ring: &IoRing, fd_raw: i32, fixed: bool) -> Option<Arc<dyn FileLike>> {
+            if fixed {
+                let idx = fd_raw as usize;
+                ring.registered_files.lock().get(idx).and_then(|s| s.clone())
+            } else {
+                get_file_like(fd_raw).ok()
+            }
+        }
+
         for i in 0..n {
             let slot = (head.wrapping_add(i as u32) as usize) & mask;
             let sqe_idx = unsafe { (*sq.array.add(slot)).load(Ordering::Acquire) } as usize & mask;
             let sqe = unsafe { &*sq.sqes.add(sqe_idx) };
+            let fixed_file = sqe.flags & 1 != 0;  // IOSQE_FIXED_FILE
 
             if sqe.opcode == OP_ACCEPT {
-                if let Ok(listener) = Socket::from_fd(sqe.fd) {
-                    accepts.push((sqe.user_data, listener));
+                if let Some(listener) = resolve_fd(self, sqe.fd, fixed_file) {
+                    if let Ok(sock) = listener.downcast_arc::<Socket>() {
+                        accepts.push((sqe.user_data, sock));
+                    }
                 }
                 continue;
             }
@@ -939,7 +1009,7 @@ impl IoRing {
             let mut duration = Duration::ZERO;
             let (file, buf, use_opcode) = match sqe.opcode {
                 OP_READ | OP_WRITE => {
-                    let file = get_file_like(sqe.fd).ok();
+                    let file = resolve_fd(self, sqe.fd, fixed_file);
                     let addr = unsafe { sqe.__bindgen_anon_2.addr as usize };
                     let buf = PinnedUserBuf::resolve(addr, sqe.len as usize)
                         .ok()
@@ -951,7 +1021,7 @@ impl IoRing {
                     // worker drives them through a readiness wait + nonblocking I/O
                     // (so a blocking RECV never wedges the single serial worker).
                     msg_flags = unsafe { sqe.__bindgen_anon_3.msg_flags };
-                    let file = get_file_like(sqe.fd).ok();
+                    let file = resolve_fd(self, sqe.fd, fixed_file);
                     let addr = unsafe { sqe.__bindgen_anon_2.addr as usize };
                     let buf = PinnedUserBuf::resolve(addr, sqe.len as usize)
                         .ok()
@@ -959,7 +1029,7 @@ impl IoRing {
                     (file, buf, sqe.opcode)
                 }
                 OP_READV | OP_WRITEV => {
-                    let file = get_file_like(sqe.fd).ok();
+                    let file = resolve_fd(self, sqe.fd, fixed_file);
                     let iov_base = unsafe { sqe.__bindgen_anon_2.addr as usize };
                     let nr = sqe.len as usize; // for readv/writev, len = iovec count
                     let mut bufs = Vec::new();
@@ -980,7 +1050,7 @@ impl IoRing {
                     (file, if bufs.is_empty() { None } else { Some(bufs) }, oc)
                 }
                 OP_READ_FIXED | OP_WRITE_FIXED => {
-                    let file = get_file_like(sqe.fd).ok();
+                    let file = resolve_fd(self, sqe.fd, fixed_file);
                     let idx = unsafe { sqe.__bindgen_anon_4.buf_index as usize };
                     let slot = self.registered_bufs.lock().get(idx).cloned();
                     match slot {
@@ -1000,7 +1070,7 @@ impl IoRing {
                 }
                 OP_POLL_ADD => {
                     poll_events = unsafe { sqe.__bindgen_anon_3.poll32_events };
-                    (get_file_like(sqe.fd).ok(), None, sqe.opcode)
+                    (resolve_fd(self, sqe.fd, fixed_file), None, sqe.opcode)
                 }
                 OP_TIMEOUT => {
                     // sqe.addr -> __kernel_timespec { tv_sec: i64, tv_nsec: i64 }.
@@ -1150,65 +1220,138 @@ lazy_static! {
     };
 }
 
+/// Per-op completion-routing state shared between the worker task and every
+/// in-flight op's [`OpWaker`].
+struct WorkerShared {
+    /// op-ids whose `OpWaker` has fired since the worker last drained. The
+    /// worker re-polls only these (plus newly-arrived ops) each round.
+    ready: Mutex<VecDeque<usize>>,
+    /// The `block_on` task's waker. `OpWaker` reads this lazily at wake time
+    /// (never captures a clone) so it always sees the freshest one.
+    worker_waker: Mutex<Option<Waker>>,
+}
+
+/// A per-op waker: when a driver (socket / pipe / timer) fires it, it pushes
+/// the op's id into `ready` and wakes the worker once. Modeled on epoll's
+/// `InterestWaker` (`kernel/src/file/epoll.rs`). Because each in-flight op has
+/// its OWN waker, a readiness event on one fd re-polls ONLY that op — there is
+/// no broadcast re-scan of all in-flight ops (the O(N²) that capped the old
+/// worker at ~96 connections, where it spent 6124 wakeups to reap 288 CQEs).
+struct OpWaker {
+    id: usize,
+    shared: Arc<WorkerShared>,
+}
+
+impl Wake for OpWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // Push the id BEFORE taking+waking, so the id is guaranteed visible to
+        // the worker's next drain (no lost wakeup even if the wake races the
+        // worker's park).
+        self.shared.ready.lock().push_back(self.id);
+        if let Some(w) = self.shared.worker_waker.lock().take() {
+            w.wake();
+        }
+    }
+}
+
+/// Monotonic op-id allocator (globally unique across the worker's lifetime;
+/// ids are never reused, so a stale `OpWaker` firing later cannot alias a new
+/// op).
+static NEXT_OP_ID: AtomicUsize = AtomicUsize::new(0);
+
 /// The single, permanent io_uring worker — a **multiplexing event loop** on one
-/// task (single-core friendly). It holds N in-flight `OpFuture`s and polls ALL
-/// of them each pass with the worker's own waker, so any op's resource
-/// readiness re-schedules the worker; ready ops complete (post CQE), and the
-/// worker parks only when nothing is ready and the queue is empty. This is what
-/// lets a single-threaded event-driven server (e.g. tokio-rs `tcp_echo`) handle
-/// many concurrent connections without head-of-line blocking — O(1) memory,
-/// real concurrency, no per-op task stack.
+/// task (single-core friendly). Unlike the old "poll ALL in-flight every wake"
+/// loop (O(N²), which thrashed at ~96 connections), this uses **per-op
+/// completion routing**: each in-flight op holds its own [`OpWaker`], so a
+/// readiness event re-polls only the op it belongs to. The worker drains the
+/// ready set + newly-arrived ops, polls just those, and parks when both are
+/// empty. O(ready) per event; O(1) task/stack memory preserved (one worker
+/// task, heap-resident `OpFuture`/`OpWaker` — no per-op stack).
 fn global_worker(queue: Arc<OpQueue>) {
+    let shared = Arc::new(WorkerShared {
+        ready: Mutex::new(VecDeque::new()),
+        worker_waker: Mutex::new(None),
+    });
     block_on(async move {
-        let mut inflight: VecDeque<OpFuture> = VecDeque::new();
+        // id -> (op future, its per-op waker Arc). One entry per in-flight op;
+        // no per-op task, no per-op stack -> O(1) task/stack memory.
+        let mut inflight: HashMap<usize, (OpFuture, Arc<OpWaker>)> = HashMap::new();
         loop {
-            // One pass: drain newly-queued ops, poll every in-flight op once,
-            // collect completions, and park if nothing progressed.
-            let done: Vec<(
-                CqRing,
-                Arc<WaitQueue>,
-                Arc<Mutex<VecDeque<(u64, i32)>>>,
-                Arc<SharedPages>,
-                u64,
-                i32,
-            )> = poll_fn(|cx| {
-                let mut progressed = false;
+            // ── Phase A: decide which op-ids to poll this round; park if none.
+            let to_poll: Vec<usize> = poll_fn(|cx| {
+                // (1) Arm BOTH wake sources BEFORE draining, so any fire during
+                //     the drain still wakes us:
+                //       - shared.worker_waker  : fired by OpWaker (resource ready)
+                //       - OpQueue.worker_waker : fired by submitter push (new op)
+                *shared.worker_waker.lock() = Some(cx.waker().clone());
+                queue.register_worker(cx);
+
+                let mut ids = Vec::new();
+                // (2) Drain newly-arrived ops: assign an id, store, and schedule
+                //     an INITIAL poll. A fresh op has registered nothing yet, so
+                //     it must be polled once to either complete (NOP) or arm its
+                //     waker on the driver.
                 while let Some(op) = queue.try_pop() {
-                    inflight.push_back(OpFuture::from(op));
-                    progressed = true;
+                    let id = NEXT_OP_ID.fetch_add(1, Ordering::Relaxed);
+                    let opw = Arc::new(OpWaker {
+                        id,
+                        shared: shared.clone(),
+                    });
+                    inflight.insert(id, (OpFuture::from(op), opw));
+                    ids.push(id);
                 }
-                let mut done = Vec::new();
-                for _ in 0..inflight.len() {
-                    let mut f = inflight.pop_front().unwrap();
-                    match Pin::new(&mut f).poll(cx) {
-                        Poll::Ready(res) => {
-                            let (cq, wq, ov, pages, ud) = f.meta();
-                            done.push((cq, wq, ov, pages, ud, res));
-                            progressed = true;
-                        }
-                        Poll::Pending => inflight.push_back(f),
-                    }
+                // (3) Drain ids whose OpWaker fired since the last round.
+                while let Some(id) = shared.ready.lock().pop_front() {
+                    ids.push(id);
                 }
-                if progressed {
-                    Poll::Ready(done)
+
+                if ids.is_empty() {
+                    Poll::Pending
                 } else {
-                    // Park: register the worker waker for new-op arrival. The
-                    // in-flight ops already registered it on their resources, so
-                    // any readiness also wakes us. Re-check the queue after
-                    // registering to avoid a lost wakeup.
-                    queue.register_worker(cx);
-                    if queue.try_pop().is_some() {
-                        Poll::Ready(Vec::new())
-                    } else {
-                        Poll::Pending
-                    }
+                    Poll::Ready(ids)
                 }
             })
             .await;
 
+            // ── Phase B: poll ONLY the candidate ids (ready + new arrivals).
+            // Collect completions and post them AFTER the poll loop (mirrors the
+            // old worker's deferred-batch post, so no CQE is written mid-poll —
+            // important under CQ overflow, where echo at >64 concurrent ops
+            // fills the 64-deep ring).
+            let mut done: Vec<(CqRing, Arc<WaitQueue>, Arc<Mutex<VecDeque<(u64, i32)>>>, Arc<SharedPages>, u64, i32)> =
+                Vec::new();
+            for id in to_poll {
+                // `remove` returns None for spurious ids: an op completed and was
+                // removed, but a stale OpWaker clone still sitting in some driver
+                // PollSet fired later. Monotonic ids never collide, so this is a
+                // safe no-op.
+                let Some((mut f, opw)) = inflight.remove(&id) else {
+                    continue;
+                };
+                let waker = Waker::from(opw.clone());
+                let mut cx = Context::from_waker(&waker);
+                match Pin::new(&mut f).poll(&mut cx) {
+                    Poll::Ready(res) => {
+                        // `_pages` (the CQ-pages keepalive) rides in `done` until
+                        // after `post_cqe` below.
+                        let (cq, wq, ov, pages, ud) = f.meta();
+                        done.push((cq, wq, ov, pages, ud, res));
+                        // `f` and `opw` drop here. Stale `opw` clones may still
+                        // live in driver PollSets; their later wake() is the
+                        // harmless spurious case handled by the `remove` guard.
+                    }
+                    Poll::Pending => {
+                        // Waker already armed during this poll; re-insert and
+                        // wait for its fire to re-schedule this id.
+                        inflight.insert(id, (f, opw));
+                    }
+                }
+            }
             for (cq, wq, ov, _pages, ud, res) in done {
-                // `_pages` (the OpFuture's CQ-pages keepalive) stays alive until
-                // the end of this iteration, i.e. past `post_cqe`.
                 post_cqe(&cq, &ov, &wq, ud, res);
             }
         }

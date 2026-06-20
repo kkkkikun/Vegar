@@ -28,3 +28,9 @@ logs/
 oscomp_test_logs/
 docs/ref/
 docs/command/
+
+# io_uring test build artifacts (statically cross-compiled by init_custom / musl-gcc)
+/io_uring_*
+/io_uring_test
+/pipe.txt
+*.log

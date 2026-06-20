@@ -20,10 +20,13 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include <time.h>
 #include "liburing_shim.h"
 
 #define PORT      7788
+#ifndef NCLIENTS
 #define NCLIENTS  24
+#endif
 #define PAYLOAD   64
 #define ENTRIES   64
 #define MAXCONN   (NCLIENTS + 8)
@@ -33,8 +36,9 @@ enum { T_ACCEPT = 0, T_RECV = 1, T_SEND = 2 };
 struct conn {
     int used;
     int fd;
-    int state;     /* T_RECV | T_SEND */
-    int remaining; /* bytes still to send (partial-send handling) */
+    int state;      /* T_RECV | T_SEND */
+    int remaining;  /* bytes still to send (partial-send handling) */
+    int send_total; /* original total bytes to echo (for partial-send offset calc) */
 };
 
 static struct conn conns[MAXCONN];
@@ -94,7 +98,8 @@ int main(void) {
     if (io_uring_queue_init(ENTRIES, &ring, 0) < 0) { printf("FAIL: queue_init\n"); return 1; }
 
     int accepted = 0, echoed = 0, failed = 0;
-    int accept_queued = 0; /* cap total queued ACCEPTs at NCLIENTS */
+    int accept_queued = 0;
+    int wakeups = 0, cqes_reaped = 0;  // worker instrumentation
     /* Queue a few ACCEPTs up front to accept clients promptly. */
     for (int i = 0; i < 4 && accept_queued < NCLIENTS; i++) {
         struct io_uring_sqe *s = io_uring_get_sqe(&ring);
@@ -103,11 +108,16 @@ int main(void) {
         accept_queued++;
     }
 
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     while (echoed + failed < NCLIENTS) {
         io_uring_submit_and_wait(&ring, 1); /* flush queued SQEs, wait for >=1 CQE */
+        wakeups++;
 
         struct io_uring_cqe *cqes[ENTRIES];
         int nr = io_uring_peek_batch_cqe(&ring, cqes, ENTRIES);
+        cqes_reaped += nr;
         for (int i = 0; i < nr; i++) {
             struct io_uring_cqe *c = cqes[i];
             uint64_t ud = c->user_data;
@@ -143,6 +153,7 @@ int main(void) {
                     } else {
                         cn->state = T_SEND;
                         cn->remaining = res;
+                        cn->send_total = res;  // save total for partial-send offset
                         struct io_uring_sqe *s = io_uring_get_sqe(&ring);
                         io_uring_prep_send(s, cn->fd, bufpool[ci], res, 0);
                         s->user_data = ci;
@@ -154,10 +165,12 @@ int main(void) {
                         echoed++;          /* whole payload echoed back */
                         close(cn->fd); cn->used = 0;
                     } else {
-                        int off = res; /* partial send: continue (rare for small payload) */
-                        (void)off;
+                        // Partial send: advance buffer by bytes already acked.
+                        // Bug fixed: `off` was previously computed but discarded,
+                        // re-sending from byte 0 and corrupting data on TCP partial send.
+                        int off = cn->send_total - cn->remaining;
                         struct io_uring_sqe *s = io_uring_get_sqe(&ring);
-                        io_uring_prep_send(s, cn->fd, bufpool[ci], cn->remaining, 0);
+                        io_uring_prep_send(s, cn->fd, bufpool[ci] + off, cn->remaining, 0);
                         s->user_data = ci;
                     }
                 }
@@ -165,6 +178,8 @@ int main(void) {
             io_uring_cqe_seen(&ring, c);
         }
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
 
     /* Reap clients, count how many got a correct echo. */
     int client_ok = 0;
@@ -175,8 +190,19 @@ int main(void) {
     }
 
     io_uring_queue_exit(&ring);
+
+    double dt_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    double total_bytes = (double)NCLIENTS * (double)PAYLOAD * 2.0;
+    double mbytes = total_bytes / (1024.0 * 1024.0);
+    double thr_mbps = (dt_ms > 0) ? mbytes / (dt_ms / 1000.0) : 0;
+
     printf("  accepted=%d echoed=%d failed=%d  clients_ok=%d/%d\n",
            accepted, echoed, failed, client_ok, NCLIENTS);
+    printf("  time=%.1f ms  throughput=%.2f MB/s\n", dt_ms, thr_mbps);
+    printf("  worker: %d wakeups, %d CQEs reaped, %.1f CQEs/wake\n",
+           wakeups, cqes_reaped,
+           wakeups > 0 ? (double)cqes_reaped / (double)wakeups : 0.0);
     if (echoed == NCLIENTS && client_ok == NCLIENTS) {
         printf("PASS: io_uring concurrent echo (event-driven, %d clients multiplexed on 1 worker)\n",
                NCLIENTS);

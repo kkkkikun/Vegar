@@ -187,4 +187,30 @@ static inline void io_uring_prep_poll_add(struct io_uring_sqe *sqe, int fd,
     sqe->poll32_events = poll_mask;
 }
 
+/* ── sqe flags ── */
+#define IOSQE_FIXED_FILE  (1U << 0)
+
+/* ── sqe_set_data / cqe_get_data (wrappers over user_data) ── */
+static inline void io_uring_sqe_set_data(struct io_uring_sqe *sqe, void *data) {
+    sqe->user_data = (uint64_t)(uintptr_t)data;
+}
+static inline void io_uring_sqe_set_flags(struct io_uring_sqe *sqe, unsigned flags) {
+    sqe->flags = (uint8_t)flags;
+}
+static inline void *io_uring_cqe_get_data(const struct io_uring_cqe *cqe) {
+    return (void *)(uintptr_t)cqe->user_data;
+}
+
+/* ── ring init with params ── */
+int io_uring_queue_init_params(unsigned entries, struct io_uring *ring,
+                               struct io_uring_params *p);
+
+/* ── register files (fd table pre-registration) ── */
+int io_uring_register_files(struct io_uring *ring, const int *files, unsigned nr);
+int io_uring_register_files_update(struct io_uring *ring, unsigned off,
+                                   const int *files, unsigned nr);
+
+/* ── shutdown ── */
+#define SHUT_RDWR 2
+
 #endif /* LIBURING_SHIM_H */

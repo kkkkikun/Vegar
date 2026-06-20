@@ -178,3 +178,67 @@ int io_uring_register_buffers(struct io_uring *ring, const struct iovec *iovs,
     return (int)syscall(__NR_io_uring_register, ring->ring_fd,
                         0 /* IORING_REGISTER_BUFFERS */, iovs, nr_iovs);
 }
+
+/* ── queue_init_params: like queue_init but passes user-provided params ── */
+int io_uring_queue_init_params(unsigned entries, struct io_uring *ring,
+                               struct io_uring_params *p) {
+    memset(ring, 0, sizeof *ring);
+    int fd = (int)io_setup(entries, p);
+    if (fd < 0) return fd;
+    ring->ring_fd = fd;
+
+    size_t page = 4096;
+    char *sq_ring = ring_mmap(fd, page, IORING_OFF_SQ_RING);
+    char *cq_ring = ring_mmap(fd, page, IORING_OFF_CQ_RING);
+    if (!sq_ring || !cq_ring) return -1;
+
+    ring->sq.ring_ptr = sq_ring;
+    ring->cq.ring_ptr = cq_ring;
+
+    ring->sq.head        = (unsigned *)(sq_ring + p->sq_off.head);
+    ring->sq.tail        = (unsigned *)(sq_ring + p->sq_off.tail);
+    ring->sq.ring_mask   = (unsigned *)(sq_ring + p->sq_off.ring_mask);
+    ring->sq.ring_entries= (unsigned *)(sq_ring + p->sq_off.ring_entries);
+    ring->sq.flags       = (unsigned *)(sq_ring + p->sq_off.flags);
+    ring->sq.dropped     = (unsigned *)(sq_ring + p->sq_off.dropped);
+    ring->sq.array       = (unsigned *)(sq_ring + p->sq_off.array);
+
+    unsigned kentries = *ring->sq.ring_entries;
+    size_t sqes_sz = ((size_t)kentries * 64 + page - 1) & ~(page - 1);
+    if (sqes_sz < page) sqes_sz = page;
+    char *sqes = ring_mmap(fd, sqes_sz, IORING_OFF_SQES);
+    if (!sqes) return -1;
+    ring->sq.sqes = (struct io_uring_sqe *)sqes;
+
+    ring->cq.head        = (unsigned *)(cq_ring + p->cq_off.head);
+    ring->cq.tail        = (unsigned *)(cq_ring + p->cq_off.tail);
+    ring->cq.ring_mask   = (unsigned *)(cq_ring + p->cq_off.ring_mask);
+    ring->cq.ring_entries= (unsigned *)(cq_ring + p->cq_off.ring_entries);
+    ring->cq.overflow    = (unsigned *)(cq_ring + p->cq_off.overflow);
+    ring->cq.cqes        = (struct io_uring_cqe *)(cq_ring + p->cq_off.cqes);
+
+    ring->sq.sqe_head = ring->sq.sqe_tail = 0;
+    return 0;
+}
+
+/* ── register files (IORING_REGISTER_FILES = 2) ── */
+int io_uring_register_files(struct io_uring *ring, const int *files, unsigned nr) {
+    return (int)syscall(__NR_io_uring_register, ring->ring_fd,
+                        2 /* IORING_REGISTER_FILES */, files, nr);
+}
+
+/* ── register files update (IORING_REGISTER_FILES_UPDATE = 18) ── */
+int io_uring_register_files_update(struct io_uring *ring, unsigned off,
+                                   const int *files, unsigned nr) {
+    struct io_uring_files_update {
+        uint32_t offset;
+        uint32_t resv;
+        uint64_t fds;
+    } up = {
+        .offset = off,
+        .resv = 0,
+        .fds = (uint64_t)(uintptr_t)files,
+    };
+    return (int)syscall(__NR_io_uring_register, ring->ring_fd,
+                        18 /* IORING_REGISTER_FILES_UPDATE */, &up, nr);
+}

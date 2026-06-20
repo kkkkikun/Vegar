@@ -163,10 +163,12 @@ int main(void) {
            (double)t_sync/(double)t_fixed);
     printf("%-18s %.2fx\n","fixed vs inline:",(double)t_inline/(double)t_fixed);
 
-    // ── Memory footprint table (analytical, based on kernel config) ──
-    // task-stack-size = 0x40000 = 256 KB  (make/defconfig.toml)
-    // io_uring: 1 worker (256 KB) + SQ ring (4 KB) + CQ ring (4 KB) + SQEs (4 KB)
+    // ── Memory footprint table ──
+    // NOTE: These numbers are CALCULATED from the kernel config's task-stack-size
+    // (256 KB), NOT measured at runtime. The only runtime memory measurements are
+    // in io_uring_vs_thread.c (via /proc/meminfo2 + /proc task count).
     printf("\n== Memory footprint (N concurrent outstanding ops) ==\n");
+    printf("  (calculated from task-stack-size=256KB; NOT runtime measurements)\n");
     printf("  task stack = 256 KB,  iouring worker + rings = ~268 KB\n\n");
     printf("  %-6s %10s %12s %12s %12s\n","N","1","4","16","64");
     printf("  %-6s %8.0fKB  %8.0fKB  %8.0fKB  %8.0fKB\n",

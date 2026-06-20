@@ -91,6 +91,42 @@ run_iouring io_uring_send_recv
 run_iouring io_uring_accept
 run_iouring io_uring_iodepth
 run_iouring io_uring_echo
+run_iouring io_uring_echo_epoll
+run_iouring io_uring_echo_srv
+
+# =========================================================================
+# Native io_uring-echo-server port (validates FAST_POLL + FIXED_FILE).
+# =========================================================================
+run_iouring_scale_srv() {
+    if [ -x "/io_uring_echo_srv" ]; then
+        echo "===== [native echo] io_uring $1 clients × $2 bytes ====="
+        /io_uring_echo_srv "$1" "$2"
+    fi
+}
+run_iouring_scale_srv 32 128
+run_iouring_scale_srv 48 128
+
+# =========================================================================
+# io_uring vs epoll at higher concurrency. Same PROVEN single-echo event loop
+# as io_uring_echo / io_uring_echo_epoll (4 initial accepts, 64B payload, 1
+# echo per client), compiled with -DNCLIENTS=N. Isolates the single variable
+# "connection count" — does io_uring's multiplexing pull ahead of epoll as N
+# grows, with everything else held fixed?
+# =========================================================================
+run_scale() {
+    name="$1"
+    if [ -x "/$name" ]; then
+        echo "===== [scale] $name ====="
+        /"$name" 2>&1 | /musl/busybox grep -E "echo:|concurrent|throughput=|time=|CQEs/wake|events/wake|clients_ok|PASS:|FAIL:"
+    else
+        echo "===== [scale] /$name NOT FOUND ====="
+    fi
+}
+for v in 48 96; do
+    run_scale "io_uring_echo$v"
+    run_scale "io_uring_echo_epoll$v"
+    /musl/busybox sleep 1
+done
 
 # =========================================================================
 # Head-to-head benchmark: io_uring (1 worker, O(1) mem) vs thread-per-conn
