@@ -31,10 +31,16 @@ impl JobControl {
     }
 
     pub fn current_in_foreground(&self) -> bool {
+        // Kernel tasks (e.g. io_uring worker) have no Thread context and are
+        // always permitted to access the terminal.
+        let curr = current();
+        let Some(thread) = curr.try_as_thread() else {
+            return true;
+        };
         self.foreground
             .lock()
             .upgrade()
-            .is_none_or(|pg| Arc::ptr_eq(&current().as_thread().proc_data.proc.group(), &pg))
+            .is_none_or(|pg| Arc::ptr_eq(&thread.proc_data.proc.group(), &pg))
     }
 
     pub fn foreground(&self) -> Option<Arc<ProcessGroup>> {

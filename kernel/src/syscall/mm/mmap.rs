@@ -99,6 +99,11 @@ pub fn sys_mmap(
         return Err(AxError::InvalidInput);
     }
 
+    // Round length up to the page size (POSIX mmap semantics). Without this,
+    // non-page-aligned sizes (e.g. io_uring ring_sz = cq_off.cqes + n*16, where
+    // cq_off.cqes = 0x18) are rejected by validate_region below.
+    let length = align_up_4k(length);
+
     let curr = current();
     let mut aspace = curr.as_thread().proc_data.aspace.lock();
     let permission_flags = MmapProt::from_bits_truncate(prot);

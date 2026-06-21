@@ -158,16 +158,21 @@ int main(void) {
                         io_uring_prep_send(s, cn->fd, bufpool[ci], res, 0);
                         s->user_data = ci;
                     }
-                } else { /* T_SEND */
+                } else if (cn->state == T_SEND) {
                     if (res <= 0) { close(cn->fd); cn->used = 0; failed++; continue; }
                     cn->remaining -= res;
                     if (cn->remaining <= 0) {
                         echoed++;          /* whole payload echoed back */
+                        /* GRACEFUL close: half-close the write side first —
+                         * shutdown(SHUT_WR) runs smoltcp close() + poll_interfaces,
+                         * flushing the echo + FIN *after* the data — THEN close.
+                         * Better than a bare close (which races smoltcp's lazy
+                         * transmit → client RST), and closes during the run so
+                         * avoids the mass-at-exit socket cleanup that segfaulted. */
+                        shutdown(cn->fd, SHUT_WR);
                         close(cn->fd); cn->used = 0;
                     } else {
                         // Partial send: advance buffer by bytes already acked.
-                        // Bug fixed: `off` was previously computed but discarded,
-                        // re-sending from byte 0 and corrupting data on TCP partial send.
                         int off = cn->send_total - cn->remaining;
                         struct io_uring_sqe *s = io_uring_get_sqe(&ring);
                         io_uring_prep_send(s, cn->fd, bufpool[ci] + off, cn->remaining, 0);

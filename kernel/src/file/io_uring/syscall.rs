@@ -13,12 +13,41 @@ use super::IoRing;
 /// `io_uring_setup(entries, params)` -> ring fd.
 pub fn sys_io_uring_setup(entries: u32, params_ptr: UserPtr<io_uring_params>) -> AxResult<isize> {
     debug!("sys_io_uring_setup <= entries: {entries}");
+
+    // Linux rejects entries=0 with EINVAL (our clamp would silently accept 0→1).
+    if entries == 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    // Validate params before creating the ring.
+    const UNSUPPORTED_FLAGS: u32 = (1 << 0)  // IORING_SETUP_IOPOLL
+                                 | (1 << 1)  // IORING_SETUP_SQPOLL
+                                 | (1 << 2); // IORING_SETUP_SQ_AFF
+    {
+        let params = params_ptr.get_as_mut()?;
+
+        // Reject unsupported flags. Use InvalidInput (EINVAL) rather than
+        // Unsupported (ENOSYS): real apps probe for SQPOLL by checking EINVAL.
+        if params.flags & UNSUPPORTED_FLAGS != 0 {
+            warn!("io_uring_setup: unsupported flags {:#x}", params.flags);
+            return Err(AxError::InvalidInput);
+        }
+
+        // Reject non-zero reserved fields (future-proofing).
+        if params.resv.iter().any(|&r| r != 0) {
+            warn!("io_uring_setup: non-zero reserved field");
+            return Err(AxError::InvalidInput);
+        }
+    }
+
     let ring = IoRing::new(entries)?;
     let n = ring.entries;
     {
         let params = params_ptr.get_as_mut()?;
         params.sq_entries = n;
-        params.cq_entries = n;
+        // §4.2: "the CQ ring is twice the size of the SQ ring" — required by the
+        // io_uring ABI so liburing can budget CQE slots correctly.
+        params.cq_entries = n * 2;
         params.flags = 0;
         params.sq_thread_cpu = 0;
         params.sq_thread_idle = 0;
@@ -69,7 +98,23 @@ pub fn sys_io_uring_enter(
     _arg: usize,
     _sz: usize,
 ) -> AxResult<isize> {
-    let ring = IoRing::from_fd(fd)?;
+    // Reject unknown flags (we only support IORING_ENTER_GETEVENTS).
+    const IORING_ENTER_GETEVENTS: u32 = 1;
+    const IORING_ENTER_KNOWN_MASK: u32 = IORING_ENTER_GETEVENTS;
+    if flags & !IORING_ENTER_KNOWN_MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let ring = match IoRing::from_fd(fd) {
+        Ok(r) => r,
+        Err(_) => {
+            // Distinguish invalid fd (EBADF) from valid-but-not-ring fd (EOPNOTSUPP).
+            if fd >= 0 && crate::file::get_file_like(fd).is_ok() {
+                return Err(AxError::OperationNotSupported);
+            }
+            return Err(AxError::BadFileDescriptor);
+        }
+    };
     // Drain all available SQEs (to_submit is treated as a hint). fd and user
     // buffer resolution happen here, in the submitter's context. ACCEPT requests
     // are returned separately (they must run in this context to install fds).

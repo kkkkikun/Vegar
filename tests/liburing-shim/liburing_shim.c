@@ -42,11 +42,30 @@ int io_uring_queue_init(unsigned entries, struct io_uring *ring, unsigned flags)
 
     size_t page = 4096;
     char *sq_ring = ring_mmap(fd, page, IORING_OFF_SQ_RING);
-    char *cq_ring = ring_mmap(fd, page, IORING_OFF_CQ_RING);
-    if (!sq_ring || !cq_ring) return -1;
+    if (!sq_ring) return -1;
+
+    /* ── CQ ring: kernel may give us more cq_entries than we asked for
+     *    (io_uring §4.2 mandates CQ ≥ 2× SQ). Compute the correct mmap
+     *    size from the kernel-reported cq_entries BEFORE mapping. ── */
+    {
+        /* Read cq_entries from the SQ ring page (sq_off is there but we need
+         * cq_entries from the io_uring_params we already have). */
+        unsigned cq_ents = p.cq_entries;
+        if (cq_ents == 0) cq_ents = p.sq_entries * 2;
+        size_t cq_sz = ((size_t)p.cq_off.cqes + (size_t)cq_ents * 16 + page - 1) & ~(page - 1);
+        if (cq_sz < page) cq_sz = page;
+        char *cq_ring = ring_mmap(fd, cq_sz, IORING_OFF_CQ_RING);
+        if (!cq_ring) return -1;
+        ring->cq.ring_ptr = cq_ring;
+        ring->cq.head        = (unsigned *)(cq_ring + p.cq_off.head);
+        ring->cq.tail        = (unsigned *)(cq_ring + p.cq_off.tail);
+        ring->cq.ring_mask   = (unsigned *)(cq_ring + p.cq_off.ring_mask);
+        ring->cq.ring_entries= (unsigned *)(cq_ring + p.cq_off.ring_entries);
+        ring->cq.overflow    = (unsigned *)(cq_ring + p.cq_off.overflow);
+        ring->cq.cqes        = (struct io_uring_cqe *)(cq_ring + p.cq_off.cqes);
+    }
 
     ring->sq.ring_ptr = sq_ring;
-    ring->cq.ring_ptr = cq_ring;
 
     ring->sq.head        = (unsigned *)(sq_ring + p.sq_off.head);
     ring->sq.tail        = (unsigned *)(sq_ring + p.sq_off.tail);
@@ -67,23 +86,21 @@ int io_uring_queue_init(unsigned entries, struct io_uring *ring, unsigned flags)
     if (!sqes) return -1;
     ring->sq.sqes = (struct io_uring_sqe *)sqes;
 
-    ring->cq.head        = (unsigned *)(cq_ring + p.cq_off.head);
-    ring->cq.tail        = (unsigned *)(cq_ring + p.cq_off.tail);
-    ring->cq.ring_mask   = (unsigned *)(cq_ring + p.cq_off.ring_mask);
-    ring->cq.ring_entries= (unsigned *)(cq_ring + p.cq_off.ring_entries);
-    ring->cq.overflow    = (unsigned *)(cq_ring + p.cq_off.overflow);
-    ring->cq.cqes        = (struct io_uring_cqe *)(cq_ring + p.cq_off.cqes);
-
     ring->sq.sqe_head = ring->sq.sqe_tail = 0;
     return 0;
 }
 
 void io_uring_queue_exit(struct io_uring *ring) {
     size_t page = 4096;
-    /* Read kentries BEFORE munmapping sq_ring — ring_entries points INTO it. */
+    /* Read kentries BEFORE unmapping — ring pointers point INTO the mappings. */
     unsigned kentries = ring->sq.ring_entries ? *ring->sq.ring_entries : 0;
+    unsigned cq_ents = ring->cq.ring_entries ? *ring->cq.ring_entries : 0;
     if (ring->sq.ring_ptr) munmap(ring->sq.ring_ptr, page);
-    if (ring->cq.ring_ptr) munmap(ring->cq.ring_ptr, page);
+    if (ring->cq.ring_ptr) {
+        size_t cq_sz = ((size_t)0x18 + (size_t)cq_ents * 16 + page - 1) & ~(page - 1);
+        if (cq_sz < page) cq_sz = page;
+        munmap(ring->cq.ring_ptr, cq_sz);
+    }
     if (ring->sq.sqes) {
         size_t sqes_sz = ((size_t)kentries * 64 + page - 1) & ~(page - 1);
         if (sqes_sz < page) sqes_sz = page;
@@ -189,11 +206,25 @@ int io_uring_queue_init_params(unsigned entries, struct io_uring *ring,
 
     size_t page = 4096;
     char *sq_ring = ring_mmap(fd, page, IORING_OFF_SQ_RING);
-    char *cq_ring = ring_mmap(fd, page, IORING_OFF_CQ_RING);
-    if (!sq_ring || !cq_ring) return -1;
+    if (!sq_ring) return -1;
+
+    /* CQ ring mmap size from kernel-reported cq_entries (may be 2× SQ). */
+    {
+        unsigned cq_ents = p->cq_entries ? p->cq_entries : p->sq_entries * 2;
+        size_t cq_sz = ((size_t)p->cq_off.cqes + (size_t)cq_ents * 16 + page - 1) & ~(page - 1);
+        if (cq_sz < page) cq_sz = page;
+        char *cq_ring = ring_mmap(fd, cq_sz, IORING_OFF_CQ_RING);
+        if (!cq_ring) return -1;
+        ring->cq.ring_ptr = cq_ring;
+        ring->cq.head        = (unsigned *)(cq_ring + p->cq_off.head);
+        ring->cq.tail        = (unsigned *)(cq_ring + p->cq_off.tail);
+        ring->cq.ring_mask   = (unsigned *)(cq_ring + p->cq_off.ring_mask);
+        ring->cq.ring_entries= (unsigned *)(cq_ring + p->cq_off.ring_entries);
+        ring->cq.overflow    = (unsigned *)(cq_ring + p->cq_off.overflow);
+        ring->cq.cqes        = (struct io_uring_cqe *)(cq_ring + p->cq_off.cqes);
+    }
 
     ring->sq.ring_ptr = sq_ring;
-    ring->cq.ring_ptr = cq_ring;
 
     ring->sq.head        = (unsigned *)(sq_ring + p->sq_off.head);
     ring->sq.tail        = (unsigned *)(sq_ring + p->sq_off.tail);
@@ -209,13 +240,6 @@ int io_uring_queue_init_params(unsigned entries, struct io_uring *ring,
     char *sqes = ring_mmap(fd, sqes_sz, IORING_OFF_SQES);
     if (!sqes) return -1;
     ring->sq.sqes = (struct io_uring_sqe *)sqes;
-
-    ring->cq.head        = (unsigned *)(cq_ring + p->cq_off.head);
-    ring->cq.tail        = (unsigned *)(cq_ring + p->cq_off.tail);
-    ring->cq.ring_mask   = (unsigned *)(cq_ring + p->cq_off.ring_mask);
-    ring->cq.ring_entries= (unsigned *)(cq_ring + p->cq_off.ring_entries);
-    ring->cq.overflow    = (unsigned *)(cq_ring + p->cq_off.overflow);
-    ring->cq.cqes        = (struct io_uring_cqe *)(cq_ring + p->cq_off.cqes);
 
     ring->sq.sqe_head = ring->sq.sqe_tail = 0;
     return 0;

@@ -75,6 +75,7 @@ const OP_WRITE: u8 = iouring::io_uring_op::IORING_OP_WRITE as u8;
 const OP_READ_FIXED: u8 = iouring::io_uring_op::IORING_OP_READ_FIXED as u8;
 const OP_WRITE_FIXED: u8 = iouring::io_uring_op::IORING_OP_WRITE_FIXED as u8;
 const OP_POLL_ADD: u8 = iouring::io_uring_op::IORING_OP_POLL_ADD as u8;
+const OP_POLL_REMOVE: u8 = iouring::io_uring_op::IORING_OP_POLL_REMOVE as u8;
 const OP_SEND: u8 = iouring::io_uring_op::IORING_OP_SEND as u8;
 const OP_RECV: u8 = iouring::io_uring_op::IORING_OP_RECV as u8;
 const OP_ACCEPT: u8 = iouring::io_uring_op::IORING_OP_ACCEPT as u8;
@@ -84,6 +85,11 @@ const OP_TIMEOUT: u8 = iouring::io_uring_op::IORING_OP_TIMEOUT as u8;
 const OP_FIXED_FAULT: u8 = 0xfd;
 /// CQE result for a fired relative timer (matches Linux io_uring semantics).
 const ENETIME: i32 = -62;
+
+/// SQE modifier flags.
+const IOSQE_FIXED_FILE: u8 = 1;
+const IOSQE_IO_DRAIN: u8 = 1 << 1;
+const IOSQE_IO_LINK: u8 = 1 << 2;
 
 /// `MSG_DONTWAIT` — recv/send without blocking (skip the readiness wait).
 const MSG_DONTWAIT: u32 = 0x40;
@@ -111,10 +117,23 @@ impl PinnedUserBuf {
             });
         }
         let curr = current();
-        let aspace = curr.as_thread().proc_data.aspace.lock();
-        let pt = aspace.page_table();
+        let mut aspace = curr.as_thread().proc_data.aspace.lock();
         let first_page = start & !0xfff;
         let last_page = (start + len - 1) & !0xfff;
+        let page_count = (last_page - first_page) / 4096 + 1;
+
+        // Fault in lazy-allocated pages: malloc without touch → no PTEs yet,
+        // so pt.query() would return BadAddress. Populate them first so
+        // io_uring READ ops can resolve the physical pages.
+        aspace.populate_area(
+            VirtAddr::from_usize(first_page),
+            page_count * 4096,
+            axhal::paging::MappingFlags::READ
+                | axhal::paging::MappingFlags::WRITE
+                | axhal::paging::MappingFlags::USER,
+        )?;
+
+        let pt = aspace.page_table();
         let mut phys = Vec::new();
         let mut va = first_page;
         while va <= last_page {
@@ -233,6 +252,13 @@ struct Op {
     /// For OP_TIMEOUT: the relative duration parsed from the sqe timespec
     /// (`Duration::ZERO` for all other opcodes).
     duration: Duration,
+    /// If `Some(err)`, the worker immediately completes with this error without
+    /// looking at the rest of the op — used for rejecting unsupported SQE flags
+    /// (IOSQE_IO_DRAIN, IOSQE_IO_LINK) at submit time.
+    error: Option<i32>,
+    /// For OP_POLL_REMOVE: the user_data of the POLL_ADD to cancel
+    /// (carried in sqe->addr by io_uring_prep_poll_remove).
+    poll_remove_target: u64,
     /// This op's CQ ring view + the pages that back it (keepalive: the pages
     /// stay pinned until the CQE is posted, even if the fd is already closed).
     cq: CqRing,
@@ -264,6 +290,11 @@ struct OpFuture {
     /// (in the worker context — `wall_time()` is read there). `Pin<Box<…>>` is
     /// `Unpin`, so `OpFuture` stays storable in a `VecDeque` without re-pinning.
     timer: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    /// If `Some(err)`, the worker immediately completes with this error without
+    /// looking at the rest of the op.
+    error: Option<i32>,
+    /// For OP_POLL_REMOVE: the user_data of the POLL_ADD to cancel.
+    poll_remove_target: u64,
     cq: CqRing,
     cq_pages: Arc<SharedPages>,
     cq_wq: Arc<WaitQueue>,
@@ -285,6 +316,8 @@ impl From<Op> for OpFuture {
             msg_flags,
             offset,
             duration,
+            error,
+            poll_remove_target,
             cq,
             cq_pages,
             cq_wq,
@@ -300,6 +333,8 @@ impl From<Op> for OpFuture {
             offset,
             duration,
             timer: None,
+            error,
+            poll_remove_target,
             cq,
             cq_pages,
             cq_wq,
@@ -459,6 +494,9 @@ impl OpFuture {
 impl Future for OpFuture {
     type Output = i32;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+        if let Some(e) = self.error {
+            return Poll::Ready(e);
+        }
         match self.opcode {
             OP_NOP => Poll::Ready(0),
             OP_POLL_ADD => match self.file.as_ref() {
@@ -537,6 +575,7 @@ struct SqRing {
     tail: *const AtomicU32,
     array: *mut AtomicU32, // sq.array[entries]
     sqes: *mut iouring::io_uring_sqe,
+    dropped: *mut AtomicU32, // SQ_OFF_DROPPED: count of invalid SQE indices
     mask: u32,
     entries: u32,
 }
@@ -596,10 +635,15 @@ impl IoRing {
         let entries = entries.clamp(1, 1 << 15).next_power_of_two();
         let entries_us = entries as usize;
 
-        // SQ/CQ ring pages: one 4K page each is enough for entries <= ~250
-        // (control fields + array[entries]*4 / cqes[entries]*16).
-        let sq_ring_pages = Arc::new(SharedPages::new(4096, axhal::paging::PageSize::Size4K)?);
-        let cq_ring_pages = Arc::new(SharedPages::new(4096, axhal::paging::PageSize::Size4K)?);
+        // SQ/CQ ring pages, sized dynamically from the entry count.
+        // SQ: control fields (0x18 B) + array[entries]*4 B.
+        // CQ: 2× SQ entries (§4.2) — control fields (0x18 B) + cqes[2n]*16 B.
+        // Both rounded up to a whole number of 4K pages.
+        let cq_entries = entries * 2;
+        let sq_bytes = (0x18 + entries_us * 4).next_multiple_of(4096);
+        let cq_bytes = (0x18 + (cq_entries as usize) * CQE_SIZE).next_multiple_of(4096);
+        let sq_ring_pages = Arc::new(SharedPages::new(sq_bytes, axhal::paging::PageSize::Size4K)?);
+        let cq_ring_pages = Arc::new(SharedPages::new(cq_bytes, axhal::paging::PageSize::Size4K)?);
         // SQE array: round up to a whole number of 4K pages (SharedPages requires
         // page-aligned sizes).
         let sqes_bytes = (SQE_SIZE * entries_us).next_multiple_of(4096);
@@ -626,9 +670,9 @@ impl IoRing {
             for i in 0..entries_us {
                 *arr.add(i) = i as u32;
             }
-            // CQ control
-            *(cq_base.add(CQ_OFF_MASK) as *mut u32) = entries - 1;
-            *(cq_base.add(CQ_OFF_ENTRIES) as *mut u32) = entries;
+            // CQ control (§4.2: CQ ring is 2× SQ ring)
+            *(cq_base.add(CQ_OFF_MASK) as *mut u32) = cq_entries - 1;
+            *(cq_base.add(CQ_OFF_ENTRIES) as *mut u32) = cq_entries;
         }
 
         let sq = SqRing {
@@ -636,6 +680,7 @@ impl IoRing {
             tail: unsafe { sq_base.add(SQ_OFF_TAIL) as *const AtomicU32 },
             array: unsafe { sq_base.add(SQ_OFF_ARRAY) as *mut AtomicU32 },
             sqes: unsafe { sqes_base as *mut iouring::io_uring_sqe },
+            dropped: unsafe { sq_base.add(SQ_OFF_DROPPED) as *mut AtomicU32 },
             mask: entries - 1,
             entries,
         };
@@ -644,8 +689,8 @@ impl IoRing {
             tail: unsafe { cq_base.add(CQ_OFF_TAIL) as *const AtomicU32 },
             cqes: unsafe { cq_base.add(CQ_OFF_CQES) as *mut iouring::io_uring_cqe },
             overflow_ctr: unsafe { cq_base.add(CQ_OFF_OVERFLOW) as *mut AtomicU32 },
-            mask: entries - 1,
-            entries,
+            mask: cq_entries - 1,
+            entries: cq_entries,
         };
 
         // Note: no per-ring worker. All rings share a single global worker
@@ -882,6 +927,7 @@ impl IoRing {
         }
         const SUPPORTED: &[u8] = &[
             OP_NOP, OP_READV, OP_WRITEV, OP_READ_FIXED, OP_WRITE_FIXED, OP_POLL_ADD,
+            OP_POLL_REMOVE,
             OP_ACCEPT, OP_READ, OP_WRITE, OP_SEND, OP_RECV, OP_TIMEOUT,
         ];
         let last_op: u8 = *SUPPORTED.iter().max().unwrap(); // RECV = 27
@@ -989,9 +1035,40 @@ impl IoRing {
 
         for i in 0..n {
             let slot = (head.wrapping_add(i as u32) as usize) & mask;
-            let sqe_idx = unsafe { (*sq.array.add(slot)).load(Ordering::Acquire) } as usize & mask;
+            let sqe_idx_raw = unsafe { (*sq.array.add(slot)).load(Ordering::Acquire) } as usize;
+            // Invalid SQE index → drop it and bump the counter (Linux-visible).
+            if sqe_idx_raw >= sq.entries as usize {
+                unsafe { (*sq.dropped).fetch_add(1, Ordering::Release) };
+                continue;
+            }
+            let sqe_idx = sqe_idx_raw & mask;
             let sqe = unsafe { &*sq.sqes.add(sqe_idx) };
-            let fixed_file = sqe.flags & 1 != 0;  // IOSQE_FIXED_FILE
+
+            // Reject unsupported SQE flags: IOSQE_IO_DRAIN (§5.1) and
+            // IOSQE_IO_LINK (§5.2) are not implemented. Deliver an error CQE
+            // via the worker so the submitter sees -EINVAL rather than silent
+            // misbehaviour.
+            if sqe.flags & (IOSQE_IO_DRAIN | IOSQE_IO_LINK) != 0 {
+                GLOBAL_QUEUE.push(Op {
+                    user_data: sqe.user_data,
+                    opcode: 0,
+                    file: None,
+                    buf: None,
+                    poll_events: 0,
+                    msg_flags: 0,
+                    offset: 0,
+                    duration: Duration::ZERO,
+                    error: Some(-22), // EINVAL
+                    poll_remove_target: 0,
+                    cq: self.cq,
+                    cq_pages: self.cq_ring_pages.clone(),
+                    cq_wq: self.cq_wq.clone(),
+                    overflow: self.overflow.clone(),
+                });
+                continue;
+            }
+
+            let fixed_file = sqe.flags & IOSQE_FIXED_FILE != 0;
 
             if sqe.opcode == OP_ACCEPT {
                 if let Some(listener) = resolve_fd(self, sqe.fd, fixed_file) {
@@ -1052,14 +1129,18 @@ impl IoRing {
                 OP_READ_FIXED | OP_WRITE_FIXED => {
                     let file = resolve_fd(self, sqe.fd, fixed_file);
                     let idx = unsafe { sqe.__bindgen_anon_4.buf_index as usize };
+                    // sqe.addr = byte offset within the registered buffer (§8.1).
+                    // sqe.len = number of bytes to read/write.
+                    let buf_off = unsafe { sqe.__bindgen_anon_2.addr as usize };
+                    let req_len = sqe.len as usize;
                     let slot = self.registered_bufs.lock().get(idx).cloned();
                     match slot {
-                        Some(Some((b, _tag))) => {
-                            let oc = if sqe.opcode == OP_READ_FIXED {
-                                OP_READ
-                            } else {
-                                OP_WRITE
-                            };
+                        Some(Some((mut b, _tag))) => {
+                            let effective =
+                                req_len.min(b.len.saturating_sub(buf_off));
+                            b.pos = buf_off;
+                            b.len = buf_off + effective;
+                            let oc = if sqe.opcode == OP_READ_FIXED { OP_READ } else { OP_WRITE };
                             (file, Some(alloc::vec![b]), oc)
                         }
                         // Sparse / unfilled slot (or out-of-range index) →
@@ -1071,6 +1152,11 @@ impl IoRing {
                 OP_POLL_ADD => {
                     poll_events = unsafe { sqe.__bindgen_anon_3.poll32_events };
                     (resolve_fd(self, sqe.fd, fixed_file), None, sqe.opcode)
+                }
+                OP_POLL_REMOVE => {
+                    // sqe->addr carries the user_data of the POLL_ADD to cancel
+                    // (set by io_uring_prep_poll_remove). No fd or buffer needed.
+                    (None, None, sqe.opcode)
                 }
                 OP_TIMEOUT => {
                     // sqe.addr -> __kernel_timespec { tv_sec: i64, tv_nsec: i64 }.
@@ -1096,6 +1182,12 @@ impl IoRing {
                 }
                 _ => (None, None, sqe.opcode),
             };
+            // POLL_REMOVE: sqe->addr carries the user_data of the POLL_ADD to cancel.
+            let poll_remove_target = if use_opcode == OP_POLL_REMOVE {
+                unsafe { sqe.__bindgen_anon_2.addr }
+            } else {
+                0
+            };
             GLOBAL_QUEUE.push(Op {
                 user_data: sqe.user_data,
                 opcode: use_opcode,
@@ -1105,6 +1197,8 @@ impl IoRing {
                 msg_flags,
                 offset: unsafe { sqe.__bindgen_anon_1.off },
                 duration,
+                error: None,
+                poll_remove_target,
                 cq: self.cq,
                 cq_pages: self.cq_ring_pages.clone(),
                 cq_wq: self.cq_wq.clone(),
@@ -1332,6 +1426,30 @@ fn global_worker(queue: Arc<OpQueue>) {
                 let Some((mut f, opw)) = inflight.remove(&id) else {
                     continue;
                 };
+
+                // ── OP_POLL_REMOVE: cancel an in-flight POLL_ADD ──
+                if f.opcode == OP_POLL_REMOVE {
+                    let target = f.poll_remove_target;
+                    // Search inflight for the matching POLL_ADD.
+                    let target_id = inflight
+                        .iter()
+                        .find(|(_, (f2, _))| {
+                            f2.opcode == OP_POLL_ADD && f2.user_data == target
+                        })
+                        .map(|(tid, _)| *tid);
+                    let remove_res = if let Some(tid) = target_id {
+                        let (target_f, _) = inflight.remove(&tid).unwrap();
+                        let (cq, wq, ov, pages, ud) = target_f.meta();
+                        done.push((cq, wq, ov, pages, ud, 0)); // cancelled, no error
+                        0 // success
+                    } else {
+                        -2 // ENOENT — already completed or never existed
+                    };
+                    let (cq, wq, ov, pages, ud) = f.meta();
+                    done.push((cq, wq, ov, pages, ud, remove_res));
+                    continue;
+                }
+
                 let waker = Waker::from(opw.clone());
                 let mut cx = Context::from_waker(&waker);
                 match Pin::new(&mut f).poll(&mut cx) {
