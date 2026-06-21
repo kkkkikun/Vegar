@@ -11,7 +11,7 @@ cd "$PROJECT_DIR"
 DOCKER_IMG="zhouzhouyi/os-contest:20260510"
 MUSL_PATH="/opt/riscv64-linux-musl-cross/bin"
 QEMU_PATH="/opt/qemu-bin-10.0.2/bin"
-TIMEOUT=${QEMU_TIMEOUT:-300}
+TIMEOUT=${QEMU_TIMEOUT:-120}
 
 # ── Step 1: Compile test binaries ──
 echo "=== [1/3] Compiling tests ==="
@@ -32,12 +32,10 @@ done
 for t in io_uring_shim_test io_uring_iodepth io_uring_echo io_uring_vs_thread; do
     [ -f tests/\$t.c ] && \$CC \$SHIM_CFLAGS tests/\$t.c \$SHIM -o \$t 2>/dev/null || true
 done
-for v in 24 48; do
+for v in 24; do
     [ -f tests/io_uring_echo_epoll.c ] && \$CC \$SHIM_CFLAGS -DNCLIENTS=\$v tests/io_uring_echo_epoll.c \$SHIM -o io_uring_echo_epoll\$v 2>/dev/null || true
     [ -f tests/io_uring_echo_epoll_fair.c ] && \$CC \$SHIM_CFLAGS -DNCLIENTS=\$v tests/io_uring_echo_epoll_fair.c \$SHIM -o io_uring_echo_epoll_fair\$v 2>/dev/null || true
 done
-# Throughput benchmark (shim-based)
-[ -f tests/io_uring_echo_throughput.c ] && \$CC \$SHIM_CFLAGS tests/io_uring_echo_throughput.c \$SHIM -o io_uring_echo_throughput 2>/dev/null || true
 echo 'Compile done.'
 "
 
@@ -51,10 +49,8 @@ mount -o loop sdcard-rv.img /mnt/sd
 for t in io_uring_nop io_uring_pipe io_uring_poll io_uring_file \
          io_uring_bench io_uring_batch io_uring_scale io_uring_getevents \
          io_uring_readv io_uring_shim_test io_uring_send_recv io_uring_accept \
-         io_uring_iodepth io_uring_echo io_uring_echo_epoll io_uring_vs_thread \
-         io_uring_echo_throughput \
-         io_uring_echo_epoll_fair24 io_uring_echo_epoll24 \
-         io_uring_echo_epoll_fair48 io_uring_echo_epoll48; do
+         io_uring_iodepth io_uring_echo io_uring_echo_epoll \
+         io_uring_echo_epoll_fair24 io_uring_echo_epoll24; do
     [ -f \$t ] && cp \$t /mnt/sd/
 done
 for t in io_uring_setup io_uring_enter poll fsync poll-cancel; do
