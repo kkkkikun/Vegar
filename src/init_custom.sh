@@ -76,10 +76,47 @@ for t in io_uring_echo_epoll_fair24 io_uring_echo_epoll24; do
 done
 
 # ========================================================================
-# [4] Benchmark: io_uring vs thread-per-conn
+# [4] Throughput sweep: io_uring vs epoll, N clients × R rounds
 # ========================================================================
 echo ""
-echo "========== [4] Benchmark: io_uring vs thread-per-conn =========="
+echo "========== [4] Sustained throughput: io_uring vs epoll =========="
+run_tp() {
+    mode="$1" n="$2" r="$3" len="$4"
+    bin="io_uring_echo_throughput"
+    if [ -f "/$bin" ]; then
+        out=$(/$bin "$mode" "$n" "$r" "$len" 2>&1)
+        if echo "$out" | /musl/busybox grep -q "throughput:"; then
+            echo "  tp $mode N=$n R=$r len=$len: $(echo "$out" | /musl/busybox grep 'throughput:' | /musl/busybox sed 's/throughput: //')"
+        else
+            echo "  tp $mode N=$n len=$len: FAIL"
+        fi
+    else
+        echo "  SKIP: /$bin not found"
+        return
+    fi
+}
+for len in 64 128; do
+    for n in 10 20 30; do
+        run_tp iouring "$n" 100 "$len"
+        run_tp epoll   "$n" 100 "$len"
+        /musl/busybox sleep 1
+    done
+done
+
+# ========================================================================
+# [5] Scale tests: higher concurrency (48, 96)
+# ========================================================================
+echo ""
+echo "========== [5] Scale: high concurrency =========="
+for t in io_uring_echo_epoll_fair48 io_uring_echo_epoll48; do
+    run_test "$t"
+done
+
+# ========================================================================
+# [6] Benchmark: io_uring vs thread-per-conn
+# ========================================================================
+echo ""
+echo "========== [6] Benchmark: io_uring vs thread-per-conn =========="
 run_test io_uring_vs_thread
 
 echo ""
