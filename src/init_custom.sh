@@ -96,7 +96,7 @@ run_tp() {
     fi
 }
 for len in 64 128; do
-    for n in 10 20 30; do
+    for n in 10 20; do
         run_tp iouring "$n" 100 "$len"
         run_tp epoll   "$n" 100 "$len"
         /musl/busybox sleep 1

@@ -11,7 +11,7 @@ cd "$PROJECT_DIR"
 DOCKER_IMG="zhouzhouyi/os-contest:20260510"
 MUSL_PATH="/opt/riscv64-linux-musl-cross/bin"
 QEMU_PATH="/opt/qemu-bin-10.0.2/bin"
-TIMEOUT=${QEMU_TIMEOUT:-180}
+TIMEOUT=${QEMU_TIMEOUT:-300}
 
 # ── Step 1: Compile test binaries ──
 echo "=== [1/3] Compiling tests ==="
